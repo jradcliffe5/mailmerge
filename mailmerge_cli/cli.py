@@ -317,7 +317,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         rows = load_recipients(args.csv)
         subject_template = Template(args.subject)
         body_template = read_template(args.body)
-        sender, password = ensure_credentials(args.sender, args.password)
+        if args.dry_run:
+            sender = args.sender or "dry-run@example.invalid"
+            password = args.password or ""
+            if not args.sender:
+                logging.debug(
+                    "Dry run without sender specified; using placeholder '%s'.",
+                    sender,
+                )
+        else:
+            sender, password = ensure_credentials(args.sender, args.password)
     except Exception as exc:
         logging.error("%s", exc)
         return 1
