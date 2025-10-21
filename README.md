@@ -1,6 +1,6 @@
 # mailmerge
 
-Send personalized email campaigns through Gmail's SMTP service using a CSV data file and text/HTML templates.
+Send personalised email campaigns through Gmail's SMTP service using a CSV data file and text/HTML templates.
 
 ## Requirements
 
@@ -15,13 +15,13 @@ Install directly from the source tree:
 python3 -m pip install .
 ```
 
-To produce distributable artifacts, run `python3 -m build` and then install the wheel:
+To produce distributable artefacts, run `python3 -m build` and then install the wheel:
 
 ```shell
 python3 -m pip install dist/gmail_mailmerge-0.3.0-py3-none-any.whl
 ```
 
-After installation, invoke the CLI with `mailmerge --help` or `python3 -m mailmerge_cli`.
+After installation, invoke the CLI with `mailmerge --help` or `python3 -m mailmerge_cli`. If you prefer not to install the package, you can run the bundled script directly with `python3 mailmerge.py`.
 
 ## Usage
 
@@ -44,13 +44,21 @@ After installation, invoke the CLI with `mailmerge --help` or `python3 -m mailme
    Jack
    ```
 
-3. Run the script:
+3. Choose how to run the tool:
 
-   ```shell
-   python3 mailmerge.py recipients.csv -s 'Project $project update' -b body.txt -n
-   ```
+   - Installed CLI via pip:
 
-   During a dry run the script prints the full rendered email (headers and body) for inspection. When `--dry-run` is used, you can omit `--sender` and `--password`; a placeholder sender address is used purely for previewing. Remove `--dry-run` to send the emails. The script reads the sender address from the `GMAIL_ADDRESS` environment variable and the Gmail app password from `GMAIL_APP_PASSWORD`. You can also pass `--sender` and `--password` explicitly (the password prompt hides your input if you omit `--password`). If you need to use double quotes around the subject, escape dollar signs as `\$` so your shell does not expand them.
+     ```shell
+     mailmerge recipients.csv --subject 'Project $project update' --body body.txt --dry-run
+     ```
+
+   - Direct script invocation:
+
+     ```shell
+     python3 mailmerge.py recipients.csv -s 'Project $project update' -b body.txt -n
+     ```
+
+   During a dry run the command prints the full rendered email (headers and body) for inspection. When `--dry-run` is used, you can omit `--sender` and `--password`; a placeholder sender address is used purely for previewing. Remove `--dry-run` to send the emails. Both entry points read the sender address from the `GMAIL_ADDRESS` environment variable and the Gmail app password from `GMAIL_APP_PASSWORD`. You can also pass `--sender` and `--password` explicitly (the password prompt hides your input if you omit `--password`). If you need to use double quotes around the subject, escape dollar signs as `\$` so your shell does not expand them.
 
 ### Additional options
 
