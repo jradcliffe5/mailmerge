@@ -72,6 +72,10 @@ After installation, invoke the CLI with `mailmerge --help` or `python3 -m mailme
 | `-f` | `--sender` | Sender email address | Defaults to `$GMAIL_ADDRESS`. |
 | `-p` | `--password` | App password | Defaults to `$GMAIL_APP_PASSWORD`; prompts if omitted. |
 | `-c` | `--recipient-column` | Recipient address column | Falls back to `email`. |
+|  | `--cc` | Additional Cc recipients | Repeatable; accepts comma/semicolon lists and supports `$placeholders`. |
+|  | `--bcc` | Additional Bcc recipients | Repeatable; accepts comma/semicolon lists and supports `$placeholders`. |
+|  | `--cc-column` | Per-recipient Cc column | Column values can contain comma/semicolon separated addresses. |
+|  | `--bcc-column` | Per-recipient Bcc column | Column values can contain comma/semicolon separated addresses. |
 | `-r` | `--reply-to` | Reply-To header | Adds a Reply-To address to outgoing emails. |
 | `-S` | `--smtp-server` | SMTP host | Defaults to `smtp.gmail.com`. |
 | `-P` | `--smtp-port` | SMTP port | Defaults to `587` (STARTTLS). |

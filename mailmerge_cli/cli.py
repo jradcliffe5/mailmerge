@@ -130,6 +130,40 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Column name in the CSV that contains recipient email addresses. Defaults to 'email'.",
     )
     parser.add_argument(
+        "--cc",
+        dest="cc",
+        action="append",
+        default=[],
+        help=(
+            "Additional Cc recipient address template. Can be provided multiple times. "
+            "Supports comma/semicolon separated lists and $placeholders."
+        ),
+    )
+    parser.add_argument(
+        "--bcc",
+        dest="bcc",
+        action="append",
+        default=[],
+        help=(
+            "Additional Bcc recipient address template. Can be provided multiple times. "
+            "Supports comma/semicolon separated lists and $placeholders."
+        ),
+    )
+    parser.add_argument(
+        "--cc-column",
+        help=(
+            "CSV column that lists Cc addresses for each recipient. "
+            "Separate multiple addresses with commas or semicolons."
+        ),
+    )
+    parser.add_argument(
+        "--bcc-column",
+        help=(
+            "CSV column that lists Bcc addresses for each recipient. "
+            "Separate multiple addresses with commas or semicolons."
+        ),
+    )
+    parser.add_argument(
         "-r",
         "--reply-to",
         help="Optional Reply-To email address to add to outgoing messages.",
@@ -267,6 +301,8 @@ def build_message(
     *,
     subtype: str,
     reply_to: str | None = None,
+    cc: Sequence[str] | None = None,
+    bcc: Sequence[str] | None = None,
     attachments: Sequence[Tuple[str, bytes, str, str]] | None = None,
 ) -> EmailMessage:
     message = EmailMessage()
@@ -275,6 +311,10 @@ def build_message(
     message["Subject"] = subject
     if reply_to:
         message["Reply-To"] = reply_to
+    if cc:
+        message["Cc"] = ", ".join(cc)
+    if bcc:
+        message["Bcc"] = ", ".join(bcc)
 
     message.set_content(body, subtype=subtype)
     if attachments:
@@ -328,6 +368,18 @@ def build_program_arguments(args: argparse.Namespace, *, schedule_spec: str | No
 
     if args.recipient_column != "email":
         command.extend(["--recipient-column", str(args.recipient_column)])
+
+    for value in getattr(args, "cc", []):
+        command.extend(["--cc", str(value)])
+
+    for value in getattr(args, "bcc", []):
+        command.extend(["--bcc", str(value)])
+
+    if args.cc_column:
+        command.extend(["--cc-column", str(args.cc_column)])
+
+    if args.bcc_column:
+        command.extend(["--bcc-column", str(args.bcc_column)])
 
     if args.reply_to:
         command.extend(["--reply-to", str(args.reply_to)])
@@ -1257,6 +1309,10 @@ def send_messages(
     subtype: str,
     delay: float,
     reply_to: str | None,
+    cc_templates: Sequence[Template],
+    bcc_templates: Sequence[Template],
+    cc_column: str | None,
+    bcc_column: str | None,
     dry_run: bool,
     limit: int | None,
     attachment_templates: Sequence[Template],
@@ -1399,6 +1455,51 @@ def send_messages(
             if not attachments_valid:
                 continue
 
+            try:
+                cc_addresses: List[str] = []
+                for template in cc_templates:
+                    rendered_cc = format_message(
+                        template,
+                        context,
+                        template_label="cc",
+                    )
+                    cc_addresses.extend(parse_addresses(rendered_cc))
+            except ValueError as exc:
+                logging.error("Skipping row %s: %s", index, exc)
+                continue
+
+            if cc_column:
+                cc_raw = row.get(cc_column)
+                if isinstance(cc_raw, str):
+                    cc_addresses.extend(parse_addresses(cc_raw))
+                elif cc_raw:
+                    cc_addresses.extend(parse_addresses(str(cc_raw)))
+
+            try:
+                bcc_addresses: List[str] = []
+                for template in bcc_templates:
+                    rendered_bcc = format_message(
+                        template,
+                        context,
+                        template_label="bcc",
+                    )
+                    bcc_addresses.extend(parse_addresses(rendered_bcc))
+            except ValueError as exc:
+                logging.error("Skipping row %s: %s", index, exc)
+                continue
+
+            if bcc_column:
+                bcc_raw = row.get(bcc_column)
+                if isinstance(bcc_raw, str):
+                    bcc_addresses.extend(parse_addresses(bcc_raw))
+                elif bcc_raw:
+                    bcc_addresses.extend(parse_addresses(str(bcc_raw)))
+
+            if cc_addresses:
+                cc_addresses = list(dict.fromkeys(cc_addresses))
+            if bcc_addresses:
+                bcc_addresses = list(dict.fromkeys(bcc_addresses))
+
             message = build_message(
                 sender,
                 recipients,
@@ -1406,6 +1507,8 @@ def send_messages(
                 body,
                 subtype=subtype,
                 reply_to=reply_to,
+                cc=cc_addresses,
+                bcc=bcc_addresses,
                 attachments=attachment_payloads,
             )
 
@@ -1525,6 +1628,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         rows = load_recipients(args.csv)
         subject_template = Template(args.subject)
         body_template = read_template(args.body)
+        cc_templates = [Template(value) for value in args.cc]
+        bcc_templates = [Template(value) for value in args.bcc]
         attachment_templates = [Template(value) for value in args.attachments]
         attachment_base = args.csv.parent.resolve()
         if args.dry_run:
@@ -1553,6 +1658,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         subtype=args.body_type,
         delay=args.delay,
         reply_to=args.reply_to,
+        cc_templates=cc_templates,
+        bcc_templates=bcc_templates,
+        cc_column=args.cc_column,
+        bcc_column=args.bcc_column,
         dry_run=args.dry_run,
         limit=args.limit,
         attachment_templates=attachment_templates,
