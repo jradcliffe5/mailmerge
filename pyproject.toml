@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gmail-mailmerge"
+version = "0.1.0"
+description = "CLI utility for Gmail-based mail merge campaigns"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "Jack Radcliffe" }]
+license = { file = "LICENSE" }
+keywords = ["mailmerge", "email", "gmail", "smtp"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: OS Independent",
+    "Topic :: Communications :: Email",
+]
+dependencies = []
+
+[project.scripts]
+mailmerge = "mailmerge_cli.cli:main"
