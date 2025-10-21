@@ -5,16 +5,33 @@ from __future__ import annotations
 import argparse
 import csv
 import getpass
+import hashlib
 import logging
 import mimetypes
 import os
+import shlex
 import smtplib
+import subprocess
 import sys
 import time
+from datetime import date as dt_date, datetime, time as dt_time, timezone, tzinfo
 from email.message import EmailMessage
 from pathlib import Path
 from string import Template
 from typing import List, Sequence, Set, Tuple
+
+try:  # Python 3.9+
+    from zoneinfo import ZoneInfo  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover
+    try:  # Python 3.8 fallback
+        from backports.zoneinfo import ZoneInfo  # type: ignore
+    except ImportError:  # pragma: no cover
+        ZoneInfo = None  # type: ignore
+
+try:  # Optional pure-Python fallback
+    import pytz  # type: ignore
+except ImportError:  # pragma: no cover
+    pytz = None  # type: ignore
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -39,12 +56,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "csv",
         type=Path,
+        nargs="?",
         help="CSV file with one row per recipient. Column names become template variables.",
     )
     parser.add_argument(
         "-s",
         "--subject",
-        required=True,
         help=(
             "Email subject template. Use Python Template placeholders, e.g. "
             "'Hello $first_name'. Wrap the value in single quotes or escape $ "
@@ -55,7 +72,6 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "-b",
         "--body",
         type=Path,
-        required=True,
         help="Path to a text or HTML template file used as the message body.",
     )
     parser.add_argument(
@@ -153,6 +169,39 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         help="Logging verbosity. Defaults to INFO.",
     )
+    parser.add_argument(
+        "--schedule",
+        metavar="CRON",
+        help=(
+            "Install this invocation in the user's crontab instead of sending immediately. "
+            "Provide a standard 5-field cron expression (e.g. '0 9 * * 1-5'), an @-macro, "
+            "or an ISO 8601 time/datetime such as '09:30' or '2024-06-05T09:30'."
+        ),
+    )
+    parser.add_argument(
+        "--schedule-timezone",
+        help=(
+            "Timezone identifier (IANA database) used when interpreting ISO schedule values, "
+            "e.g. 'Europe/London'. Defaults to the system timezone."
+        ),
+    )
+    parser.add_argument(
+        "--schedule-label",
+        help=(
+            "Identifier used to mark the cron entry. Defaults to the CSV file stem. "
+            "Combine with --schedule-overwrite to update an existing entry."
+        ),
+    )
+    parser.add_argument(
+        "--schedule-overwrite",
+        action="store_true",
+        help="Replace an existing cron entry that uses the same schedule label.",
+    )
+    parser.add_argument(
+        "--schedule-remove-all",
+        action="store_true",
+        help="Remove every cron entry created by mailmerge. Other cron jobs remain untouched.",
+    )
     return parser.parse_args(argv)
 
 
@@ -211,6 +260,314 @@ def build_message(
                 filename=filename,
             )
     return message
+
+
+CRON_COMMENT_PREFIX = "# mailmerge schedule:"
+
+
+def build_cron_command(args: argparse.Namespace) -> str:
+    parts: List[str] = [
+        shlex.quote(sys.executable),
+        "-m",
+        "mailmerge_cli",
+        shlex.quote(str(args.csv)),
+        "--subject",
+        shlex.quote(args.subject),
+        "--body",
+        shlex.quote(str(args.body)),
+    ]
+
+    if args.body_type != "plain":
+        parts.extend(["--body-type", shlex.quote(args.body_type)])
+
+    for attachment in args.attachments:
+        parts.extend(["--attachment", shlex.quote(attachment)])
+
+    if args.attachment_column:
+        parts.extend(["--attachment-column", shlex.quote(args.attachment_column)])
+
+    if args.sender:
+        parts.extend(["--sender", shlex.quote(args.sender)])
+
+    if args.password:
+        parts.extend(["--password", shlex.quote(args.password)])
+
+    if args.recipient_column != "email":
+        parts.extend(["--recipient-column", shlex.quote(args.recipient_column)])
+
+    if args.reply_to:
+        parts.extend(["--reply-to", shlex.quote(args.reply_to)])
+
+    if args.smtp_server != "smtp.gmail.com":
+        parts.extend(["--smtp-server", shlex.quote(args.smtp_server)])
+
+    if args.smtp_port != 587:
+        parts.extend(["--smtp-port", shlex.quote(str(args.smtp_port))])
+
+    if args.delay > 0:
+        parts.extend(["--delay", shlex.quote(str(args.delay))])
+
+    if args.dry_run:
+        parts.append("--dry-run")
+
+    if args.limit is not None:
+        parts.extend(["--limit", shlex.quote(str(args.limit))])
+
+    if args.log_level.upper() != "INFO":
+        parts.extend(["--log-level", shlex.quote(args.log_level.upper())])
+
+    return " ".join(parts)
+
+
+def read_crontab_lines() -> List[str]:
+    result = subprocess.run(
+        ["crontab", "-l"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode == 0:
+        return result.stdout.splitlines()
+    stderr = result.stderr.strip().lower()
+    if result.returncode == 1 and "no crontab" in stderr:
+        return []
+    raise RuntimeError(f"Unable to read crontab: {result.stderr.strip() or result.stdout.strip()}")
+
+
+def write_crontab_lines(lines: Sequence[str]) -> None:
+    new_content = "\n".join(lines).rstrip("\n") + "\n"
+    result = subprocess.run(
+        ["crontab", "-"],
+        input=new_content,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to update crontab: {result.stderr.strip() or result.stdout.strip()}")
+
+
+def resolve_schedule_timezone(name: str | None) -> tzinfo | None:
+    if not name:
+        return None
+    if ZoneInfo is None:
+        if pytz is None:
+            raise RuntimeError(
+                "Timezone support requires Python 3.9+ (zoneinfo module), the 'backports.zoneinfo' package, "
+                "or 'pytz'. Install one of these to use --schedule-timezone."
+            )
+        try:
+            zone = pytz.timezone(name)
+        except Exception as exc:
+            raise ValueError(f"Unknown timezone identifier '{name}'.") from exc
+        setattr(zone, "key", getattr(zone, "key", getattr(zone, "zone", name)))
+        return zone
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        if pytz is None:
+            raise
+        try:
+            zone = pytz.timezone(name)
+        except Exception as exc:
+            raise ValueError(f"Unknown timezone identifier '{name}'.") from exc
+        setattr(zone, "key", getattr(zone, "key", getattr(zone, "zone", name)))
+        return zone
+
+
+def describe_timezone(zone: tzinfo | None) -> str:
+    if zone is None:
+        return "UTC"
+    key = getattr(zone, "key", None)
+    if key:
+        return str(key)
+    zone_name = getattr(zone, "zone", None)
+    if zone_name:
+        return str(zone_name)
+    name = zone.tzname(None)
+    if name:
+        return name
+    return str(zone)
+
+
+def ensure_timezone(zone: tzinfo | None) -> tzinfo:
+    if zone is None:
+        return timezone.utc
+    return zone
+
+
+def ensure_datetime_timezone(dt_value: datetime, zone: tzinfo | None) -> datetime:
+    if dt_value.tzinfo is not None:
+        if zone is None:
+            return dt_value
+        return dt_value.astimezone(ensure_timezone(zone))
+    tz_obj = ensure_timezone(zone)
+    localize = getattr(tz_obj, "localize", None)
+    if callable(localize):
+        return localize(dt_value)  # type: ignore[call-arg]
+    return dt_value.replace(tzinfo=tz_obj)
+
+
+def combine_time_with_timezone(date_value: dt_date, time_value: dt_time, zone: tzinfo | None) -> datetime:
+    if time_value.tzinfo is not None:
+        naive_time = time_value.replace(tzinfo=None)
+        base_dt = datetime.combine(date_value, naive_time)
+        return ensure_datetime_timezone(base_dt, time_value.tzinfo)
+    base_dt = datetime.combine(date_value, time_value)
+    return ensure_datetime_timezone(base_dt, zone)
+
+
+def normalize_schedule(schedule: str, tz_hint: tzinfo | None, local_zone: tzinfo) -> tuple[str, str]:
+    cleaned = schedule.strip()
+    if not cleaned or any(char in cleaned for char in "\r\n"):
+        raise ValueError("Schedule expression must be a single non-empty line.")
+
+    if cleaned.startswith("@"):
+        return cleaned, cleaned
+
+    fields = cleaned.split()
+    if len(fields) in {5, 6}:
+        return cleaned, cleaned
+
+    cron_from_iso = convert_iso_to_cron(cleaned, tz_hint, local_zone)
+    if cron_from_iso is None:
+        raise ValueError(
+            "Schedule must be a cron expression (five fields, or @daily/@hourly etc.) "
+            "or an ISO 8601 time/datetime such as '09:30' or '2024-06-05T09:30'."
+        )
+    return cron_from_iso, cleaned
+
+
+def convert_iso_to_cron(value: str, tz_hint: tzinfo | None, local_zone: tzinfo) -> str | None:
+    candidate = value.strip()
+    if candidate.endswith("Z") and candidate.count("Z") == 1:
+        candidate = candidate[:-1] + "+00:00"
+
+    try:
+        dt_value = datetime.fromisoformat(candidate)
+    except ValueError:
+        dt_value = None
+
+    if dt_value is not None:
+        source_zone = dt_value.tzinfo or tz_hint or local_zone
+        dt_with_tz = ensure_datetime_timezone(dt_value, source_zone)
+        dt_local = dt_with_tz.astimezone(local_zone)
+        return f"{dt_local.minute} {dt_local.hour} {dt_local.day} {dt_local.month} *"
+
+    time_candidate = value.strip()
+    if time_candidate.startswith("T"):
+        time_candidate = time_candidate[1:]
+    if time_candidate.endswith("Z") and time_candidate.count("Z") == 1:
+        time_candidate = time_candidate[:-1] + "+00:00"
+
+    try:
+        time_value = dt_time.fromisoformat(time_candidate)
+    except ValueError:
+        return None
+
+    source_zone = time_value.tzinfo or tz_hint or local_zone
+    reference_date = datetime.now(ensure_timezone(source_zone)).date()
+    combined = combine_time_with_timezone(reference_date, time_value, source_zone)
+    local_time = combined.astimezone(local_zone)
+
+    return f"{local_time.minute} {local_time.hour} * * *"
+
+
+def install_cron_job(args: argparse.Namespace) -> None:
+    schedule = args.schedule.strip()
+
+    local_zone = datetime.now().astimezone().tzinfo or timezone.utc
+    tz_hint = resolve_schedule_timezone(args.schedule_timezone)
+
+    cron_spec, display_schedule = normalize_schedule(schedule, tz_hint, local_zone)
+
+    command = build_cron_command(args)
+    label_seed = args.schedule_label or args.csv.stem or "mailmerge"
+    fingerprint = hashlib.sha1(command.encode("utf-8")).hexdigest()[:8]
+    comment_label = f"{CRON_COMMENT_PREFIX} {label_seed}"
+    comment_line = f"{comment_label} ({fingerprint})"
+
+    lines = read_crontab_lines()
+    existing_index = next(
+        (index for index, line in enumerate(lines) if line.startswith(comment_label)),
+        None,
+    )
+
+    if existing_index is not None:
+        if not args.schedule_overwrite:
+            raise RuntimeError(
+                f"Cron entry already exists for label '{label_seed}'. "
+                "Re-run with --schedule-overwrite to replace it."
+            )
+        del lines[existing_index]
+        if existing_index < len(lines):
+            del lines[existing_index]
+        while existing_index < len(lines) and not lines[existing_index].strip():
+            del lines[existing_index]
+
+    if lines and lines[-1].strip():
+        lines.append("")
+    lines.extend([comment_line, f"{cron_spec} {command}"])
+    write_crontab_lines(lines)
+
+    system_zone_label = describe_timezone(local_zone)
+    if args.schedule_timezone:
+        logging.info(
+            "Installed cron entry '%s' (%s interpreted in %s) using cron spec '%s' (system timezone %s).",
+            label_seed,
+            display_schedule,
+            args.schedule_timezone,
+            cron_spec,
+            system_zone_label,
+        )
+    else:
+        logging.info(
+            "Installed cron entry '%s' (%s) using cron spec '%s' (system timezone %s).",
+            label_seed,
+            display_schedule,
+            cron_spec,
+            system_zone_label,
+        )
+    if not args.password and not os.getenv("GMAIL_APP_PASSWORD"):
+        logging.warning(
+            "Cron job does not include a password. Ensure the job environment defines GMAIL_APP_PASSWORD."
+        )
+    if not args.sender and not os.getenv("GMAIL_ADDRESS"):
+        logging.warning(
+            "Cron job does not include a sender address. Ensure the job environment defines GMAIL_ADDRESS."
+        )
+
+
+def remove_mailmerge_cron_jobs() -> int:
+    lines = read_crontab_lines()
+    if not lines:
+        return 0
+
+    new_lines: List[str] = []
+    skip_next = False
+    removed_jobs = 0
+
+    for line in lines:
+        if skip_next:
+            skip_next = False
+            continue
+        if line.startswith(CRON_COMMENT_PREFIX):
+            skip_next = True
+            removed_jobs += 1
+            if new_lines and not new_lines[-1].strip():
+                new_lines.pop()
+            continue
+        new_lines.append(line)
+
+    while new_lines and not new_lines[-1].strip():
+        new_lines.pop()
+
+    if removed_jobs > 0:
+        write_crontab_lines(new_lines)
+
+    return removed_jobs
 
 
 def ensure_credentials(sender: str | None, password: str | None) -> Tuple[str, str]:
@@ -441,6 +798,58 @@ def send_messages(
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     logging.basicConfig(level=args.log_level, format="%(levelname)s: %(message)s")
+
+    schedule_requested = bool(args.schedule)
+    remove_requested = bool(args.schedule_remove_all)
+
+    if remove_requested and schedule_requested:
+        logging.error("Cannot combine --schedule with --schedule-remove-all.")
+        return 1
+
+    if remove_requested and (args.schedule_label or args.schedule_overwrite):
+        logging.error("--schedule-remove-all cannot be combined with other scheduling flags.")
+        return 1
+
+    if remove_requested:
+        try:
+            removed = remove_mailmerge_cron_jobs()
+        except Exception as exc:
+            logging.error("%s", exc)
+            return 1
+        if removed:
+            plural = "entry" if removed == 1 else "entries"
+            logging.info("Removed %s scheduled mailmerge cron %s.", removed, plural)
+        else:
+            logging.info("No mailmerge cron entries found to remove.")
+        return 0
+
+    if args.csv is None:
+        logging.error("CSV file is required unless --schedule-remove-all is provided.")
+        return 1
+    if args.subject is None:
+        logging.error("Subject template is required.")
+        return 1
+    if args.body is None:
+        logging.error("Body template path is required.")
+        return 1
+
+    args.csv = args.csv.expanduser().resolve()
+    args.body = args.body.expanduser().resolve()
+
+    if not args.csv.is_file():
+        logging.error("CSV file not found: %s", args.csv)
+        return 1
+    if not args.body.is_file():
+        logging.error("Body template file not found: %s", args.body)
+        return 1
+
+    if args.schedule:
+        try:
+            install_cron_job(args)
+        except Exception as exc:
+            logging.error("%s", exc)
+            return 1
+        return 0
 
     try:
         rows = load_recipients(args.csv)

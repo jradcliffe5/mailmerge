@@ -79,5 +79,34 @@ After installation, invoke the CLI with `mailmerge --help` or `python3 -m mailme
 | `-l` | `--limit` | Limit number of recipients processed | Helpful for quick tests. |
 | `-L` | `--log-level` | Logging verbosity | Accepts `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
 | `-n` | `--dry-run` | Preview emails without sending | Prints rendered messages to stdout. |
+|  | `--schedule` | Install command in crontab | Provide a cron expression (`0 9 * * 1-5`), an `@daily`/`@hourly` macro, or an ISO time like `09:30` / `2024-06-05T09:30`. |
+|  | `--schedule-timezone` | Timezone for ISO schedules | IANA tz name (e.g. `Europe/London`) used when parsing ISO times/dates. |
+|  | `--schedule-label` | Cron entry identifier | Defaults to the CSV file stem; combine with `--schedule-overwrite`. |
+|  | `--schedule-overwrite` | Replace existing cron entry | Updates the cron job that matches `--schedule-label`. |
+|  | `--schedule-remove-all` | Delete mailmerge cron entries | Removes every cron job previously created by this tool. |
 
 Run `python3 mailmerge.py --help` to see the full list of flags.
+
+### Scheduling with cron
+
+Use `--schedule` to register the current invocation in your user crontab so the emails are sent later from the same machine:
+
+```shell
+mailmerge recipients.csv \
+  --subject 'Project $project update' \
+  --body body.txt \
+  --sender you@example.com \
+  --password 'your app password' \
+  --schedule "0 9 * * 1-5" \
+  --schedule-label project-updates
+```
+
+Instead of a cron expression you can also use ISO 8601 times (`--schedule 09:30` to send daily at 09:30) or datetimes (`--schedule 2024-06-05T09:30`). Use `--schedule-timezone` when the ISO value should be interpreted in a specific timezone—mailmerge converts it to the machine’s local timezone before writing the cron entry (e.g. `--schedule 09:30 --schedule-timezone Europe/London`). For ISO datetimes, cron repeats the job yearly on the same calendar date—delete the entry after it runs if you only need a one-off. The command stores a two-line block in `crontab -l`: a marker comment and the full mailmerge command. Re-running with the same `--schedule-label` and `--schedule-overwrite` refreshes the job. If you omit `--sender` or `--password`, ensure the cron environment exports `GMAIL_ADDRESS` and `GMAIL_APP_PASSWORD` before the job runs. The machine must stay powered, logged in, and connected to the internet at the scheduled time. Remove the job later with `crontab -e` or by editing the crontab to delete the comment/command pair.
+
+> **Note:** Python 3.8 users need either `backports.zoneinfo` or `pytz` to resolve IANA timezones (e.g. `python3 -m pip install backports.zoneinfo` or `python3 -m pip install pytz`).
+
+To delete every cron entry previously added by mailmerge without touching any other jobs, run:
+
+```shell
+mailmerge --schedule-remove-all
+```
