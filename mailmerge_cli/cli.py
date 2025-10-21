@@ -42,6 +42,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="CSV file with one row per recipient. Column names become template variables.",
     )
     parser.add_argument(
+        "-s",
         "--subject",
         required=True,
         help=(
@@ -51,18 +52,21 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "-b",
         "--body",
         type=Path,
         required=True,
         help="Path to a text or HTML template file used as the message body.",
     )
     parser.add_argument(
+        "-t",
         "--body-type",
         choices=("plain", "html"),
         default="plain",
         help="Content type for the email body. Defaults to plain text.",
     )
     parser.add_argument(
+        "-a",
         "--attachment",
         dest="attachments",
         action="append",
@@ -73,6 +77,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "-A",
         "--attachment-column",
         help=(
             "CSV column that lists attachment paths for each recipient. "
@@ -80,6 +85,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "-f",
         "--sender",
         default=os.getenv("GMAIL_ADDRESS"),
         help=(
@@ -88,6 +94,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "-p",
         "--password",
         default=os.getenv("GMAIL_APP_PASSWORD"),
         help=(
@@ -97,42 +104,50 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "-c",
         "--recipient-column",
         default="email",
         help="Column name in the CSV that contains recipient email addresses. Defaults to 'email'.",
     )
     parser.add_argument(
+        "-r",
         "--reply-to",
         help="Optional Reply-To email address to add to outgoing messages.",
     )
     parser.add_argument(
+        "-S",
         "--smtp-server",
         default="smtp.gmail.com",
         help="SMTP server hostname. Defaults to Gmail's SMTP server.",
     )
     parser.add_argument(
+        "-P",
         "--smtp-port",
         type=int,
         default=587,
         help="SMTP port number. Defaults to 587 (STARTTLS).",
     )
     parser.add_argument(
+        "-d",
         "--delay",
         type=float,
         default=0.0,
         help="Optional delay in seconds between messages.",
     )
     parser.add_argument(
+        "-n",
         "--dry-run",
         action="store_true",
         help="Preview emails without sending anything.",
     )
     parser.add_argument(
+        "-l",
         "--limit",
         type=int,
         help="Only send to the first N rows in the CSV.",
     )
     parser.add_argument(
+        "-L",
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),

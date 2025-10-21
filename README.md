@@ -18,7 +18,7 @@ python3 -m pip install .
 To produce distributable artifacts, run `python3 -m build` and then install the wheel:
 
 ```shell
-python3 -m pip install dist/gmail_mailmerge-0.1.0-py3-none-any.whl
+python3 -m pip install dist/gmail_mailmerge-0.3.0-py3-none-any.whl
 ```
 
 After installation, invoke the CLI with `mailmerge --help` or `python3 -m mailmerge_cli`.
@@ -47,18 +47,29 @@ After installation, invoke the CLI with `mailmerge --help` or `python3 -m mailme
 3. Run the script:
 
    ```shell
-   python3 mailmerge.py recipients.csv --subject 'Project $project update' --body body.txt --dry-run
+   python3 mailmerge.py recipients.csv -s 'Project $project update' -b body.txt -n
    ```
 
    During a dry run the script prints the full rendered email (headers and body) for inspection. When `--dry-run` is used, you can omit `--sender` and `--password`; a placeholder sender address is used purely for previewing. Remove `--dry-run` to send the emails. The script reads the sender address from the `GMAIL_ADDRESS` environment variable and the Gmail app password from `GMAIL_APP_PASSWORD`. You can also pass `--sender` and `--password` explicitly (the password prompt hides your input if you omit `--password`). If you need to use double quotes around the subject, escape dollar signs as `\$` so your shell does not expand them.
 
 ### Additional options
 
-- `--body-type html` sends the template as HTML.
-- `--delay 1.5` pauses between messages to avoid rate limits.
-- `--limit 5` only processes the first 5 rows for testing.
-- `--recipient-column contact_email` uses a different column for email addresses.
-- `--attachment docs/handout.pdf` attaches one or more files to every email. Use the flag multiple times to add more attachments. Paths support `$placeholders` and are resolved relative to the CSV file.
-- `--attachment-column files` loads attachment paths from a CSV column. Separate multiple paths with commas or semicolons. Relative paths are resolved from the CSV directory.
+| Short | Long | Purpose | Notes |
+| --- | --- | --- | --- |
+| `-s` | `--subject` | Subject template | Uses `$placeholders` from the CSV. |
+| `-b` | `--body` | Body template path | Reads either plain text or HTML. |
+| `-t` | `--body-type` | Body format | Use `html` to send HTML emails (default is plain text). |
+| `-a` | `--attachment` | Static attachment path(s) | Repeat the flag to add more files. Paths can include `$placeholders` and are resolved relative to the CSV file. |
+| `-A` | `--attachment-column` | Per-recipient attachments | Column can contain comma/semicolon delimited paths. |
+| `-f` | `--sender` | Sender email address | Defaults to `$GMAIL_ADDRESS`. |
+| `-p` | `--password` | App password | Defaults to `$GMAIL_APP_PASSWORD`; prompts if omitted. |
+| `-c` | `--recipient-column` | Recipient address column | Falls back to `email`. |
+| `-r` | `--reply-to` | Reply-To header | Adds a Reply-To address to outgoing emails. |
+| `-S` | `--smtp-server` | SMTP host | Defaults to `smtp.gmail.com`. |
+| `-P` | `--smtp-port` | SMTP port | Defaults to `587` (STARTTLS). |
+| `-d` | `--delay` | Delay between emails | Useful to avoid rate limits (e.g. `-d 1.5`). |
+| `-l` | `--limit` | Limit number of recipients processed | Helpful for quick tests. |
+| `-L` | `--log-level` | Logging verbosity | Accepts `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
+| `-n` | `--dry-run` | Preview emails without sending | Prints rendered messages to stdout. |
 
 Run `python3 mailmerge.py --help` to see the full list of flags.
