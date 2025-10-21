@@ -6,6 +6,7 @@ import argparse
 import csv
 import getpass
 import logging
+import mimetypes
 import os
 import smtplib
 import sys
@@ -13,7 +14,7 @@ import time
 from email.message import EmailMessage
 from pathlib import Path
 from string import Template
-from typing import List, Sequence, Tuple
+from typing import List, Sequence, Set, Tuple
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -60,6 +61,23 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         choices=("plain", "html"),
         default="plain",
         help="Content type for the email body. Defaults to plain text.",
+    )
+    parser.add_argument(
+        "--attachment",
+        dest="attachments",
+        action="append",
+        default=[],
+        help=(
+            "Path template for an attachment. Can be provided multiple times. "
+            "Supports $placeholders from the CSV."
+        ),
+    )
+    parser.add_argument(
+        "--attachment-column",
+        help=(
+            "CSV column that lists attachment paths for each recipient. "
+            "Separate multiple paths with commas or semicolons."
+        ),
     )
     parser.add_argument(
         "--sender",
@@ -145,6 +163,12 @@ def parse_addresses(raw: str) -> List[str]:
     return [addr.strip() for addr in raw.replace(";", ",").split(",") if addr.strip()]
 
 
+def parse_list_entries(raw: str | None) -> List[str]:
+    if not raw:
+        return []
+    return [value.strip() for value in raw.replace(";", ",").split(",") if value.strip()]
+
+
 def build_message(
     sender: str,
     recipients: Sequence[str],
@@ -153,6 +177,7 @@ def build_message(
     *,
     subtype: str,
     reply_to: str | None = None,
+    attachments: Sequence[Tuple[str, bytes, str, str]] | None = None,
 ) -> EmailMessage:
     message = EmailMessage()
     message["From"] = sender
@@ -162,6 +187,14 @@ def build_message(
         message["Reply-To"] = reply_to
 
     message.set_content(body, subtype=subtype)
+    if attachments:
+        for filename, content, maintype, subtype_name in attachments:
+            message.add_attachment(
+                content,
+                maintype=maintype,
+                subtype=subtype_name,
+                filename=filename,
+            )
     return message
 
 
@@ -210,6 +243,9 @@ def send_messages(
     reply_to: str | None,
     dry_run: bool,
     limit: int | None,
+    attachment_templates: Sequence[Template],
+    attachment_column: str | None,
+    attachment_base: Path,
 ) -> None:
     total = len(rows) if limit is None else min(limit, len(rows))
     if total == 0:
@@ -270,6 +306,83 @@ def send_messages(
 
             logging.debug("Row %s context: %s", index, context)
 
+            attachment_values: List[str] = []
+            attachment_payloads: List[Tuple[str, bytes, str, str]]
+
+            attachments_valid = True
+            for template in attachment_templates:
+                try:
+                    rendered = format_message(
+                        template,
+                        context,
+                        template_label="attachment",
+                    )
+                except ValueError as exc:
+                    logging.error("Skipping row %s: %s", index, exc)
+                    attachments_valid = False
+                    break
+                attachment_values.extend(parse_list_entries(rendered))
+
+            if not attachments_valid:
+                continue
+
+            if attachment_column:
+                attachment_values.extend(parse_list_entries(row.get(attachment_column)))
+
+            resolved_paths: List[Path] = []
+            seen_paths: Set[Path] = set()
+            for raw_path in attachment_values:
+                candidate = Path(raw_path).expanduser()
+                if not candidate.is_absolute():
+                    candidate = (attachment_base / candidate).resolve()
+                else:
+                    candidate = candidate.resolve()
+                if candidate in seen_paths:
+                    continue
+                seen_paths.add(candidate)
+                resolved_paths.append(candidate)
+
+            attachment_payloads = []
+            for attachment_path in resolved_paths:
+                if not attachment_path.exists():
+                    logging.error(
+                        "Skipping row %s: attachment not found: %s",
+                        index,
+                        attachment_path,
+                    )
+                    attachments_valid = False
+                    break
+                if not attachment_path.is_file():
+                    logging.error(
+                        "Skipping row %s: attachment path is not a file: %s",
+                        index,
+                        attachment_path,
+                    )
+                    attachments_valid = False
+                    break
+                try:
+                    data = attachment_path.read_bytes()
+                except OSError as exc:
+                    logging.error(
+                        "Skipping row %s: unable to read attachment %s (%s)",
+                        index,
+                        attachment_path,
+                        exc,
+                    )
+                    attachments_valid = False
+                    break
+                mime_type, _ = mimetypes.guess_type(str(attachment_path))
+                if mime_type:
+                    maintype, subtype = mime_type.split("/", 1)
+                else:
+                    maintype, subtype = "application", "octet-stream"
+                attachment_payloads.append(
+                    (attachment_path.name, data, maintype, subtype)
+                )
+
+            if not attachments_valid:
+                continue
+
             message = build_message(
                 sender,
                 recipients,
@@ -277,6 +390,7 @@ def send_messages(
                 body,
                 subtype=subtype,
                 reply_to=reply_to,
+                attachments=attachment_payloads,
             )
 
             if dry_run:
@@ -317,6 +431,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         rows = load_recipients(args.csv)
         subject_template = Template(args.subject)
         body_template = read_template(args.body)
+        attachment_templates = [Template(value) for value in args.attachments]
+        attachment_base = args.csv.parent.resolve()
         if args.dry_run:
             sender = args.sender or "dry-run@example.invalid"
             password = args.password or ""
@@ -345,6 +461,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         reply_to=args.reply_to,
         dry_run=args.dry_run,
         limit=args.limit,
+        attachment_templates=attachment_templates,
+        attachment_column=args.attachment_column,
+        attachment_base=attachment_base,
     )
     return 0
 

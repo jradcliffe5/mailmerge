@@ -58,5 +58,7 @@ After installation, invoke the CLI with `mailmerge --help` or `python3 -m mailme
 - `--delay 1.5` pauses between messages to avoid rate limits.
 - `--limit 5` only processes the first 5 rows for testing.
 - `--recipient-column contact_email` uses a different column for email addresses.
+- `--attachment docs/handout.pdf` attaches one or more files to every email. Use the flag multiple times to add more attachments. Paths support `$placeholders` and are resolved relative to the CSV file.
+- `--attachment-column files` loads attachment paths from a CSV column. Separate multiple paths with commas or semicolons. Relative paths are resolved from the CSV directory.
 
 Run `python3 mailmerge.py --help` to see the full list of flags.
