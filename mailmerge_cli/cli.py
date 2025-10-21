@@ -6,15 +6,19 @@ import argparse
 import csv
 import getpass
 import hashlib
+import json
 import logging
 import mimetypes
 import os
+import plistlib
+import re
 import shlex
+import shutil
 import smtplib
 import subprocess
 import sys
 import time
-from datetime import date as dt_date, datetime, time as dt_time, timezone, tzinfo
+from datetime import date as dt_date, datetime, time as dt_time, timedelta, timezone, tzinfo
 from email.message import EmailMessage
 from pathlib import Path
 from string import Template
@@ -179,6 +183,16 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--schedule-backend",
+        choices=("auto", "cron", "launchd", "systemd"),
+        default="auto",
+        help=(
+            "Scheduler to configure when using --schedule. "
+            "Defaults to 'auto' (launchd on macOS, systemd on Linux if available, otherwise cron). "
+            "Use 'cron', 'launchd', or 'systemd' to force a specific backend."
+        ),
+    )
+    parser.add_argument(
         "--schedule-timezone",
         help=(
             "Timezone identifier (IANA database) used when interpreting ISO schedule values, "
@@ -200,7 +214,19 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--schedule-remove-all",
         action="store_true",
-        help="Remove every cron entry created by mailmerge. Other cron jobs remain untouched.",
+        help=(
+            "Remove every scheduled entry created by mailmerge for the selected backend "
+            "(backend defaults to auto-detected unless overridden)."
+        ),
+    )
+    parser.add_argument(
+        "--schedule-spec",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--schedule-state",
+        type=Path,
+        help=argparse.SUPPRESS,
     )
     return parser.parse_args(argv)
 
@@ -263,60 +289,78 @@ def build_message(
 
 
 CRON_COMMENT_PREFIX = "# mailmerge schedule:"
+LAUNCHD_LABEL_PREFIX = "com.gmailmailmerge."
+SYSTEMD_UNIT_PREFIX = "mailmerge-"
 
 
-def build_cron_command(args: argparse.Namespace) -> str:
-    parts: List[str] = [
-        shlex.quote(sys.executable),
+def sanitize_label_seed(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "-", value)
+    sanitized = sanitized.strip(".-")
+    return sanitized or "mailmerge"
+
+
+def build_program_arguments(args: argparse.Namespace, *, schedule_spec: str | None = None, state_path: Path | None = None) -> List[str]:
+    command: List[str] = [
+        sys.executable,
         "-m",
         "mailmerge_cli",
-        shlex.quote(str(args.csv)),
+        str(args.csv),
         "--subject",
-        shlex.quote(args.subject),
+        args.subject,
         "--body",
-        shlex.quote(str(args.body)),
+        str(args.body),
     ]
 
     if args.body_type != "plain":
-        parts.extend(["--body-type", shlex.quote(args.body_type)])
+        command.extend(["--body-type", args.body_type])
 
     for attachment in args.attachments:
-        parts.extend(["--attachment", shlex.quote(attachment)])
+        command.extend(["--attachment", str(attachment)])
 
     if args.attachment_column:
-        parts.extend(["--attachment-column", shlex.quote(args.attachment_column)])
+        command.extend(["--attachment-column", str(args.attachment_column)])
 
     if args.sender:
-        parts.extend(["--sender", shlex.quote(args.sender)])
+        command.extend(["--sender", str(args.sender)])
 
     if args.password:
-        parts.extend(["--password", shlex.quote(args.password)])
+        command.extend(["--password", str(args.password)])
 
     if args.recipient_column != "email":
-        parts.extend(["--recipient-column", shlex.quote(args.recipient_column)])
+        command.extend(["--recipient-column", str(args.recipient_column)])
 
     if args.reply_to:
-        parts.extend(["--reply-to", shlex.quote(args.reply_to)])
+        command.extend(["--reply-to", str(args.reply_to)])
 
     if args.smtp_server != "smtp.gmail.com":
-        parts.extend(["--smtp-server", shlex.quote(args.smtp_server)])
+        command.extend(["--smtp-server", str(args.smtp_server)])
 
     if args.smtp_port != 587:
-        parts.extend(["--smtp-port", shlex.quote(str(args.smtp_port))])
+        command.extend(["--smtp-port", str(args.smtp_port)])
 
     if args.delay > 0:
-        parts.extend(["--delay", shlex.quote(str(args.delay))])
+        command.extend(["--delay", str(args.delay)])
 
     if args.dry_run:
-        parts.append("--dry-run")
+        command.append("--dry-run")
 
     if args.limit is not None:
-        parts.extend(["--limit", shlex.quote(str(args.limit))])
+        command.extend(["--limit", str(args.limit)])
 
     if args.log_level.upper() != "INFO":
-        parts.extend(["--log-level", shlex.quote(args.log_level.upper())])
+        command.extend(["--log-level", args.log_level.upper()])
 
-    return " ".join(parts)
+    if schedule_spec:
+        command.extend(["--schedule-spec", schedule_spec])
+    if state_path:
+        command.extend(["--schedule-state", str(state_path)])
+
+    return command
+
+
+def build_cron_command(args: argparse.Namespace, *, schedule_spec: str | None = None, state_path: Path | None = None) -> str:
+    parts = build_program_arguments(args, schedule_spec=schedule_spec, state_path=state_path)
+    return " ".join(shlex.quote(part) for part in parts)
 
 
 def read_crontab_lines() -> List[str]:
@@ -419,6 +463,284 @@ def combine_time_with_timezone(date_value: dt_date, time_value: dt_time, zone: t
     return ensure_datetime_timezone(base_dt, zone)
 
 
+def require_backend_supported(backend: str) -> None:
+    if backend == "launchd" and sys.platform != "darwin":
+        raise RuntimeError("The launchd backend is only available on macOS.")
+    if backend == "systemd" and not sys.platform.startswith("linux"):
+        raise RuntimeError("The systemd backend is only available on Linux.")
+
+
+def detect_default_backend() -> str:
+    if sys.platform == "darwin":
+        return "launchd"
+    if sys.platform.startswith("linux") and shutil.which("systemctl"):
+        return "systemd"
+    return "cron"
+
+
+def determine_backend(choice: str | None) -> str:
+    if not choice or choice == "auto":
+        backend = detect_default_backend()
+    else:
+        backend = choice
+    require_backend_supported(backend)
+    return backend
+
+
+def schedule_state_base_dir() -> Path:
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "mailmerge"
+    base_dir = Path.home() / ".local" / "share" / "mailmerge"
+    return base_dir
+
+
+def schedule_state_dir() -> Path:
+    path = schedule_state_base_dir() / "schedule-state"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def build_state_path(label_seed: str, fingerprint: str) -> Path:
+    filename = f"{label_seed}-{fingerprint}.json"
+    return schedule_state_dir() / filename
+
+
+def parse_cron_value(value: str) -> int | None:
+    if value == "*":
+        return None
+    parsed = int(value)
+    return parsed
+
+
+def cron_matches(dt_value: datetime, minute: int | None, hour: int | None, day: int | None, month: int | None, weekday: int | None) -> bool:
+    if minute is not None and dt_value.minute != minute:
+        return False
+    if hour is not None and dt_value.hour != hour:
+        return False
+    if month is not None and dt_value.month != month:
+        return False
+    if day is not None and dt_value.day != day:
+        return False
+    if weekday is not None:
+        cron_weekday = (dt_value.weekday() + 1) % 7
+        target = weekday % 7
+        if cron_weekday != target:
+            return False
+    return True
+
+
+def parse_cron_spec(cron_spec: str) -> tuple[int | None, int | None, int | None, int | None, int | None]:
+    minute_s, hour_s, day_s, month_s, weekday_s = cron_spec.split()
+    return (
+        parse_cron_value(minute_s),
+        parse_cron_value(hour_s),
+        parse_cron_value(day_s),
+        parse_cron_value(month_s),
+        parse_cron_value(weekday_s),
+    )
+
+
+def next_run_time(cron_spec: str, start: datetime) -> datetime:
+    minute, hour, day, month, weekday = parse_cron_spec(cron_spec)
+    candidate = (start + timedelta(minutes=1)).replace(second=0, microsecond=0)
+    limit = candidate + timedelta(days=366)
+    while candidate <= limit:
+        if cron_matches(candidate, minute, hour, day, month, weekday):
+            return candidate
+        candidate += timedelta(minutes=1)
+    raise RuntimeError(f"Unable to compute next run time for cron spec: {cron_spec}")
+
+
+def initialize_schedule_state(state_path: Path, cron_spec: str, *, overwrite: bool) -> datetime:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    if state_path.exists() and not overwrite:
+        try:
+            with state_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            next_due_str = data.get("next_due")
+            if next_due_str:
+                return datetime.fromisoformat(next_due_str)
+        except Exception:
+            pass
+    now = datetime.now().replace(second=0, microsecond=0)
+    next_due = next_run_time(cron_spec, now - timedelta(minutes=1))
+    data = {
+        "next_due": next_due.isoformat(),
+        "last_run": None,
+    }
+    with state_path.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+    return next_due
+
+
+def update_schedule_state(cron_spec: str, state_path: Path) -> tuple[bool, datetime]:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now().replace(second=0, microsecond=0)
+    data: dict
+    if state_path.exists():
+        try:
+            with state_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            data = {}
+    else:
+        data = {}
+
+    next_due_str = data.get("next_due")
+    if next_due_str:
+        try:
+            next_due = datetime.fromisoformat(next_due_str)
+        except ValueError:
+            next_due = next_run_time(cron_spec, now - timedelta(minutes=1))
+    else:
+        next_due = next_run_time(cron_spec, now - timedelta(minutes=1))
+
+    due = now >= next_due
+    if due:
+        next_after = next_run_time(cron_spec, next_due)
+        data["last_run"] = now.isoformat()
+        data["next_due"] = next_after.isoformat()
+        with state_path.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        return True, next_after
+
+    # Not due yet, ensure next_due is recorded
+    data.setdefault("next_due", next_due.isoformat())
+    if "last_run" not in data:
+        data["last_run"] = None
+    with state_path.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+    return False, next_due
+
+
+def remove_schedule_state(state_path: Path) -> None:
+    try:
+        state_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def remove_schedule_state_by_label(label_seed: str) -> int:
+    state_dir = schedule_state_dir()
+    count = 0
+    for path in state_dir.glob(f"{label_seed}-*.json"):
+        try:
+            path.unlink()
+            count += 1
+        except FileNotFoundError:
+            continue
+    return count
+
+
+def extract_state_path_from_arguments(arguments: Sequence[str]) -> Path | None:
+    for index, value in enumerate(arguments):
+        if value == "--schedule-state" and index + 1 < len(arguments):
+            return Path(arguments[index + 1]).expanduser()
+    return None
+
+
+def extract_state_path_from_command_line(command_line: str) -> Path | None:
+    try:
+        tokens = shlex.split(command_line)
+    except ValueError:
+        return None
+    return extract_state_path_from_arguments(tokens)
+
+
+def prepare_schedule(args: argparse.Namespace) -> tuple[str, str, tzinfo, tzinfo]:
+    if not args.schedule:
+        raise ValueError("Schedule string is required.")
+    schedule_text = args.schedule.strip()
+    local_zone = datetime.now().astimezone().tzinfo or timezone.utc
+    tz_hint = resolve_schedule_timezone(args.schedule_timezone)
+    cron_spec, display_schedule = normalize_schedule(schedule_text, tz_hint, local_zone)
+    macro_map = {
+        "@yearly": "0 0 1 1 *",
+        "@annually": "0 0 1 1 *",
+        "@monthly": "0 0 1 * *",
+        "@weekly": "0 0 * * 0",
+        "@daily": "0 0 * * *",
+        "@midnight": "0 0 * * *",
+        "@hourly": "0 * * * *",
+    }
+    cron_spec = macro_map.get(cron_spec, cron_spec)
+    return cron_spec, display_schedule, local_zone, tz_hint
+
+
+def _parse_numeric_field(field: str, name: str, *, allow_wildcard: bool = True) -> int | None:
+    if field == "*":
+        if allow_wildcard:
+            return None
+        raise ValueError(f"{name} must be a fixed value for this scheduler backend.")
+    if not field.isdigit():
+        raise ValueError(
+            f"{name} value '{field}' is not supported. Only single integer values are allowed for this backend."
+        )
+    return int(field)
+
+
+def cron_to_launchd_interval(cron_spec: str) -> dict:
+    minute, hour, day, month, weekday = cron_spec.split()
+    minute_value = _parse_numeric_field(minute, "minute", allow_wildcard=False)
+    hour_value = _parse_numeric_field(hour, "hour", allow_wildcard=False)
+    day_value = _parse_numeric_field(day, "day")
+    month_value = _parse_numeric_field(month, "month")
+    weekday_value = _parse_numeric_field(weekday, "weekday")
+
+    if day_value is not None and weekday_value is not None:
+        raise ValueError(
+            "launchd backend does not support combining specific days-of-month and weekdays simultaneously."
+        )
+
+    interval: dict[str, int] = {"Minute": minute_value, "Hour": hour_value}
+    if day_value is not None:
+        interval["Day"] = day_value
+    if month_value is not None:
+        interval["Month"] = month_value
+    if weekday_value is not None:
+        interval["Weekday"] = weekday_value
+    return interval
+
+
+def cron_to_systemd_calendar(cron_spec: str) -> str:
+    minute, hour, day, month, weekday = cron_spec.split()
+    minute_value = _parse_numeric_field(minute, "minute", allow_wildcard=False)
+    hour_value = _parse_numeric_field(hour, "hour", allow_wildcard=False)
+    day_value = _parse_numeric_field(day, "day")
+    month_value = _parse_numeric_field(month, "month")
+    weekday_value = _parse_numeric_field(weekday, "weekday")
+
+    if day_value is not None and weekday_value is not None:
+        raise ValueError(
+            "systemd backend cannot express both a specific day-of-month and weekday at the same time."
+        )
+
+    def pad(value: int | None) -> str:
+        if value is None:
+            return "*"
+        return f"{value:02d}"
+
+    date_part = f"*-{pad(month_value)}-{pad(day_value)}"
+    time_part = f"{hour_value:02d}:{minute_value:02d}:00"
+
+    if weekday_value is not None:
+        weekday_map = {
+            0: "Sun",
+            1: "Mon",
+            2: "Tue",
+            3: "Wed",
+            4: "Thu",
+            5: "Fri",
+            6: "Sat",
+            7: "Sun",
+        }
+        if weekday_value not in weekday_map:
+            raise ValueError("Weekday must be between 0 (Sunday) and 7 (Sunday).")
+        return f"{weekday_map[weekday_value]} *-{pad(month_value)}-* {time_part}"
+
+    return f"*-{pad(month_value)}-{pad(day_value)} {time_part}"
+
+
 def normalize_schedule(schedule: str, tz_hint: tzinfo | None, local_zone: tzinfo) -> tuple[str, str]:
     cleaned = schedule.strip()
     if not cleaned or any(char in cleaned for char in "\r\n"):
@@ -476,16 +798,18 @@ def convert_iso_to_cron(value: str, tz_hint: tzinfo | None, local_zone: tzinfo) 
 
 
 def install_cron_job(args: argparse.Namespace) -> None:
-    schedule = args.schedule.strip()
+    cron_spec, display_schedule, local_zone, _ = prepare_schedule(args)
 
-    local_zone = datetime.now().astimezone().tzinfo or timezone.utc
-    tz_hint = resolve_schedule_timezone(args.schedule_timezone)
-
-    cron_spec, display_schedule = normalize_schedule(schedule, tz_hint, local_zone)
-
-    command = build_cron_command(args)
     label_seed = args.schedule_label or args.csv.stem or "mailmerge"
-    fingerprint = hashlib.sha1(command.encode("utf-8")).hexdigest()[:8]
+    label_seed = sanitize_label_seed(label_seed)
+
+    base_command = build_program_arguments(args)
+    fingerprint_source = "\n".join(base_command + [cron_spec])
+    fingerprint = hashlib.sha1(fingerprint_source.encode("utf-8")).hexdigest()[:8]
+    state_path = build_state_path(label_seed, fingerprint)
+    next_due = initialize_schedule_state(state_path, cron_spec, overwrite=args.schedule_overwrite)
+
+    command = build_cron_command(args, schedule_spec=cron_spec, state_path=state_path)
     comment_label = f"{CRON_COMMENT_PREFIX} {label_seed}"
     comment_line = f"{comment_label} ({fingerprint})"
 
@@ -513,23 +837,16 @@ def install_cron_job(args: argparse.Namespace) -> None:
     write_crontab_lines(lines)
 
     system_zone_label = describe_timezone(local_zone)
-    if args.schedule_timezone:
-        logging.info(
-            "Installed cron entry '%s' (%s interpreted in %s) using cron spec '%s' (system timezone %s).",
-            label_seed,
-            display_schedule,
-            args.schedule_timezone,
-            cron_spec,
-            system_zone_label,
-        )
-    else:
-        logging.info(
-            "Installed cron entry '%s' (%s) using cron spec '%s' (system timezone %s).",
-            label_seed,
-            display_schedule,
-            cron_spec,
-            system_zone_label,
-        )
+    tz_note = f" interpreted in {args.schedule_timezone}" if args.schedule_timezone else ""
+    logging.info(
+        "Installed cron entry '%s' (%s%s) using cron spec '%s' (system timezone %s).",
+        label_seed,
+        display_schedule,
+        tz_note,
+        cron_spec,
+        system_zone_label,
+    )
+    logging.info("Next run scheduled for %s.", next_due.isoformat())
     if not args.password and not os.getenv("GMAIL_APP_PASSWORD"):
         logging.warning(
             "Cron job does not include a password. Ensure the job environment defines GMAIL_APP_PASSWORD."
@@ -540,26 +857,247 @@ def install_cron_job(args: argparse.Namespace) -> None:
         )
 
 
+def install_launchd_job(args: argparse.Namespace) -> None:
+    require_backend_supported("launchd")
+    cron_spec, display_schedule, local_zone, _ = prepare_schedule(args)
+    interval = cron_to_launchd_interval(cron_spec)
+
+    label_seed_raw = args.schedule_label or args.csv.stem or "mailmerge"
+    label_seed = sanitize_label_seed(label_seed_raw)
+    base_command = build_program_arguments(args)
+    fingerprint_source = "\n".join(base_command + [cron_spec])
+    fingerprint = hashlib.sha1(fingerprint_source.encode("utf-8")).hexdigest()[:8]
+    state_path = build_state_path(label_seed, fingerprint)
+    next_due = initialize_schedule_state(state_path, cron_spec, overwrite=args.schedule_overwrite)
+
+    label = f"{LAUNCHD_LABEL_PREFIX}{label_seed}"
+
+    launch_agents_dir = Path.home() / "Library" / "LaunchAgents"
+    launch_agents_dir.mkdir(parents=True, exist_ok=True)
+    plist_path = launch_agents_dir / f"{label}.plist"
+
+    program_args = build_program_arguments(args, schedule_spec=cron_spec, state_path=state_path)
+    log_dir = Path.home() / "Library" / "Logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{label}.log"
+
+    if plist_path.exists():
+        if not args.schedule_overwrite:
+            raise RuntimeError(
+                f"LaunchAgent '{label}' already exists. Use --schedule-overwrite to replace it."
+            )
+        subprocess.run(
+            ["launchctl", "bootout", f"gui/{os.getuid()}", str(plist_path)],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    payload = {
+        "Label": label,
+        "ProgramArguments": program_args,
+        "RunAtLoad": True,
+        "StartCalendarInterval": interval,
+        "StandardOutPath": str(log_path),
+        "StandardErrorPath": str(log_path),
+        "WorkingDirectory": str(args.csv.parent),
+    }
+
+    with plist_path.open("wb") as handle:
+        plistlib.dump(payload, handle)
+
+    load_result = subprocess.run(
+        ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if load_result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to load launchd job: {load_result.stderr.strip() or load_result.stdout.strip()}"
+        )
+
+    system_zone_label = describe_timezone(local_zone)
+    tz_note = f" interpreted in {args.schedule_timezone}" if args.schedule_timezone else ""
+    logging.info(
+        "Installed launchd job '%s' (%s%s) with StartCalendarInterval %s (system timezone %s).",
+        label,
+        display_schedule,
+        tz_note,
+        interval,
+        system_zone_label,
+    )
+    logging.info("Next run scheduled for %s.", next_due.isoformat())
+
+    if not args.password and not os.getenv("GMAIL_APP_PASSWORD"):
+        logging.warning(
+            "Launchd job does not include a password. Ensure the environment provides GMAIL_APP_PASSWORD."
+        )
+    if not args.sender and not os.getenv("GMAIL_ADDRESS"):
+        logging.warning(
+            "Launchd job does not include a sender address. Ensure the environment provides GMAIL_ADDRESS."
+        )
+
+
+def install_systemd_job(args: argparse.Namespace) -> None:
+    require_backend_supported("systemd")
+    if shutil.which("systemctl") is None:
+        raise RuntimeError("systemctl not found. The systemd backend requires systemctl to manage timers.")
+
+    cron_spec, display_schedule, local_zone, _ = prepare_schedule(args)
+    calendar_spec = cron_to_systemd_calendar(cron_spec)
+
+    label_seed_raw = args.schedule_label or args.csv.stem or "mailmerge"
+    label_seed = sanitize_label_seed(label_seed_raw)
+    base_command = build_program_arguments(args)
+    fingerprint_source = "\n".join(base_command + [cron_spec])
+    fingerprint = hashlib.sha1(fingerprint_source.encode("utf-8")).hexdigest()[:8]
+    state_path = build_state_path(label_seed, fingerprint)
+    next_due = initialize_schedule_state(state_path, cron_spec, overwrite=args.schedule_overwrite)
+
+    unit_name = f"{SYSTEMD_UNIT_PREFIX}{label_seed}"
+
+    systemd_dir = Path.home() / ".config" / "systemd" / "user"
+    systemd_dir.mkdir(parents=True, exist_ok=True)
+
+    service_path = systemd_dir / f"{unit_name}.service"
+    timer_path = systemd_dir / f"{unit_name}.timer"
+
+    program_args = build_program_arguments(args, schedule_spec=cron_spec, state_path=state_path)
+    exec_start = shlex.join(program_args)
+
+    service_unit = "\n".join(
+        [
+            "[Unit]",
+            f"Description=Mailmerge job {label_seed}",
+            "",
+            "[Service]",
+            "Type=oneshot",
+            f"WorkingDirectory={args.csv.parent}",
+            f"ExecStart={exec_start}",
+            "",
+            "[Install]",
+            "WantedBy=default.target",
+            "",
+        ]
+    )
+
+    timer_unit = "\n".join(
+        [
+            "[Unit]",
+            f"Description=Mailmerge timer {label_seed}",
+            "",
+            "[Timer]",
+            f"OnCalendar={calendar_spec}",
+            "Persistent=true",
+            f"Unit={unit_name}.service",
+            "",
+            "[Install]",
+            "WantedBy=timers.target",
+            "",
+        ]
+    )
+
+    if (service_path.exists() or timer_path.exists()) and not args.schedule_overwrite:
+        raise RuntimeError(
+            f"Systemd units for '{unit_name}' already exist. Use --schedule-overwrite to replace them."
+        )
+
+    if timer_path.exists():
+        subprocess.run(
+            ["systemctl", "--user", "disable", "--now", f"{unit_name}.timer"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    with service_path.open("w", encoding="utf-8") as handle:
+        handle.write(service_unit)
+    with timer_path.open("w", encoding="utf-8") as handle:
+        handle.write(timer_unit)
+
+    reload_result = subprocess.run(
+        ["systemctl", "--user", "daemon-reload"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if reload_result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to reload systemd user units: {reload_result.stderr.strip() or reload_result.stdout.strip()}"
+        )
+
+    enable_result = subprocess.run(
+        ["systemctl", "--user", "enable", "--now", f"{unit_name}.timer"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if enable_result.returncode != 0:
+        raise RuntimeError(
+            f"Failed to enable systemd timer: {enable_result.stderr.strip() or enable_result.stdout.strip()}"
+        )
+
+    system_zone_label = describe_timezone(local_zone)
+    tz_note = f" interpreted in {args.schedule_timezone}" if args.schedule_timezone else ""
+    logging.info(
+        "Installed systemd timer '%s' (%s%s) with OnCalendar '%s' (system timezone %s, Persistent=true).",
+        unit_name,
+        display_schedule,
+        tz_note,
+        calendar_spec,
+        system_zone_label,
+    )
+    logging.info("Next run scheduled for %s.", next_due.isoformat())
+
+    if not args.password and not os.getenv("GMAIL_APP_PASSWORD"):
+        logging.warning(
+            "Systemd job does not include a password. Ensure the job environment defines GMAIL_APP_PASSWORD."
+        )
+    if not args.sender and not os.getenv("GMAIL_ADDRESS"):
+        logging.warning(
+            "Systemd job does not include a sender address. Ensure the job environment defines GMAIL_ADDRESS."
+        )
+
+
 def remove_mailmerge_cron_jobs() -> int:
     lines = read_crontab_lines()
     if not lines:
         return 0
 
     new_lines: List[str] = []
-    skip_next = False
     removed_jobs = 0
-
-    for line in lines:
-        if skip_next:
-            skip_next = False
-            continue
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         if line.startswith(CRON_COMMENT_PREFIX):
-            skip_next = True
+            match = re.match(rf"{re.escape(CRON_COMMENT_PREFIX)}\s+([^\s(]+)(?:\s+\(([0-9a-fA-F]+)\))?", line)
+            label_seed = None
+            fingerprint = None
+            if match:
+                label_seed = match.group(1)
+                fingerprint = match.group(2)
+
+            command_line = lines[index + 1] if index + 1 < len(lines) else ""
+            state_path = extract_state_path_from_command_line(command_line)
+            if state_path is not None:
+                remove_schedule_state(state_path)
+            elif label_seed is not None:
+                remove_schedule_state_by_label(label_seed)
+
+            index += 2
             removed_jobs += 1
             if new_lines and not new_lines[-1].strip():
                 new_lines.pop()
             continue
+
         new_lines.append(line)
+        index += 1
 
     while new_lines and not new_lines[-1].strip():
         new_lines.pop()
@@ -568,6 +1106,112 @@ def remove_mailmerge_cron_jobs() -> int:
         write_crontab_lines(new_lines)
 
     return removed_jobs
+
+
+def remove_launchd_jobs() -> int:
+    require_backend_supported("launchd")
+    launch_agents_dir = Path.home() / "Library" / "LaunchAgents"
+    if not launch_agents_dir.exists():
+        return 0
+
+    removed = 0
+    uid = os.getuid()
+    for plist_path in launch_agents_dir.glob(f"{LAUNCHD_LABEL_PREFIX}*.plist"):
+        state_path = None
+        if plist_path.stem.startswith(LAUNCHD_LABEL_PREFIX):
+            label_seed = plist_path.stem[len(LAUNCHD_LABEL_PREFIX) :]
+        else:
+            label_seed = plist_path.stem
+        try:
+            with plist_path.open("rb") as handle:
+                payload = plistlib.load(handle)
+            program_args = payload.get("ProgramArguments", []) or []
+            state_path_candidate = extract_state_path_from_arguments(program_args)
+            if state_path_candidate is not None:
+                state_path = state_path_candidate
+        except Exception:
+            state_path = None
+        subprocess.run(
+            ["launchctl", "bootout", f"gui/{uid}", str(plist_path)],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            plist_path.unlink()
+            removed += 1
+        except FileNotFoundError:
+            continue
+        if state_path is not None:
+            remove_schedule_state(state_path)
+        else:
+            remove_schedule_state_by_label(label_seed)
+    return removed
+
+
+def remove_systemd_jobs() -> int:
+    require_backend_supported("systemd")
+    systemd_dir = Path.home() / ".config" / "systemd" / "user"
+    if not systemd_dir.exists():
+        return 0
+
+    timers = list(systemd_dir.glob(f"{SYSTEMD_UNIT_PREFIX}*.timer"))
+    if not timers:
+        return 0
+
+    has_systemctl = shutil.which("systemctl") is not None
+    removed = 0
+
+    for timer_path in timers:
+        unit_name = timer_path.stem
+        if unit_name.startswith(SYSTEMD_UNIT_PREFIX):
+            label_seed = unit_name[len(SYSTEMD_UNIT_PREFIX) :]
+        else:
+            label_seed = unit_name
+        if has_systemctl:
+            subprocess.run(
+                ["systemctl", "--user", "disable", "--now", f"{unit_name}.timer"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        service_path = systemd_dir / f"{unit_name}.service"
+        state_path = None
+        if service_path.exists():
+            try:
+                content = service_path.read_text(encoding="utf-8")
+                for line in content.splitlines():
+                    if line.startswith("ExecStart="):
+                        command_line = line.partition("=")[2].strip()
+                        state_candidate = extract_state_path_from_command_line(command_line)
+                        if state_candidate is not None:
+                            state_path = state_candidate
+                        break
+            except Exception:
+                state_path = None
+        try:
+            timer_path.unlink()
+            removed += 1
+        except FileNotFoundError:
+            continue
+        if service_path.exists():
+            service_path.unlink()
+        if state_path is not None:
+            remove_schedule_state(state_path)
+        else:
+            remove_schedule_state_by_label(label_seed)
+
+    if removed and has_systemctl:
+        subprocess.run(
+            ["systemctl", "--user", "daemon-reload"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    return removed
 
 
 def ensure_credentials(sender: str | None, password: str | None) -> Tuple[str, str]:
@@ -799,10 +1443,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     logging.basicConfig(level=args.log_level, format="%(levelname)s: %(message)s")
 
-    schedule_requested = bool(args.schedule)
     remove_requested = bool(args.schedule_remove_all)
+    backend = determine_backend(args.schedule_backend)
 
-    if remove_requested and schedule_requested:
+    if remove_requested and args.schedule:
         logging.error("Cannot combine --schedule with --schedule-remove-all.")
         return 1
 
@@ -812,15 +1456,25 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if remove_requested:
         try:
-            removed = remove_mailmerge_cron_jobs()
+            if backend == "cron":
+                removed = remove_mailmerge_cron_jobs()
+            elif backend == "launchd":
+                removed = remove_launchd_jobs()
+            else:
+                removed = remove_systemd_jobs()
         except Exception as exc:
             logging.error("%s", exc)
             return 1
         if removed:
             plural = "entry" if removed == 1 else "entries"
-            logging.info("Removed %s scheduled mailmerge cron %s.", removed, plural)
+            logging.info(
+                "Removed %s scheduled mailmerge %s %s.",
+                removed,
+                backend,
+                plural,
+            )
         else:
-            logging.info("No mailmerge cron entries found to remove.")
+            logging.info("No mailmerge %s entries found to remove.", backend)
         return 0
 
     if args.csv is None:
@@ -845,11 +1499,27 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.schedule:
         try:
-            install_cron_job(args)
+            if backend == "cron":
+                install_cron_job(args)
+            elif backend == "launchd":
+                install_launchd_job(args)
+            else:
+                install_systemd_job(args)
         except Exception as exc:
             logging.error("%s", exc)
             return 1
         return 0
+
+    if args.schedule_state and args.schedule_spec:
+        try:
+            due, next_due = update_schedule_state(args.schedule_spec, args.schedule_state)
+        except Exception as exc:
+            logging.error("Failed to evaluate schedule state: %s", exc)
+            return 1
+        if not due:
+            logging.info("No messages due. Next run scheduled for %s.", next_due.isoformat())
+            return 0
+        logging.info("Scheduled time reached; proceeding with mail merge. Next run scheduled for %s.", next_due.isoformat())
 
     try:
         rows = load_recipients(args.csv)
