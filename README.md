@@ -2,124 +2,168 @@
 
 Send personalised email campaigns through Gmail's SMTP service using a CSV data file and text/HTML templates.
 
-## Requirements
+## Highlights
+- Personalise every message with `$variables` pulled from your CSV.
+- Send plain text or HTML emails (with automatic HTML detection and wrapping).
+- Preview the full email safely with `--dry-run` before delivering it.
+- Attach shared or per-recipient files and schedule future sends on cron, launchd, or systemd.
 
+## Requirements
 - Python 3.8+
 - A Gmail account with [2-Step Verification](https://myaccount.google.com/u/0/security) enabled and an [App Password](https://support.google.com/accounts/answer/185833) generated for "Mail".
 
 ## Installation
 
-Install directly from the source tree:
-
+### Install from the source tree
 ```shell
 python3 -m pip install .
 ```
 
-To produce distributable artefacts, run `python3 -m build` and then install the wheel:
-
+### Build and install a wheel (optional)
 ```shell
+python3 -m build
 python3 -m pip install dist/gmail_mailmerge-0.9.0-py3-none-any.whl
 ```
 
-After installation, invoke the CLI with `mailmerge --help` or `python3 -m mailmerge_cli`. If you prefer not to install the package, you can run the bundled script directly with `python3 mailmerge.py`.
+### Run without installing
+After cloning the repository you can execute the script directly:
+```shell
+python3 mailmerge.py --help
+```
+You can also run the installed console script via `mailmerge --help` or `python3 -m mailmerge_cli`.
 
-## Usage
+## Quick start
 
-1. Create a CSV file with one recipient per row. The column headers become template variables:
+### 1. Prepare your recipient data
+- Create a CSV file with one row per recipient; column headers become template variables.
+- Example (`recipients.csv`):
+  ```csv
+  email,first_name,project
+  alice@example.com,Alice,Apollo
+  bob@example.com,Bob,Zephyr
+  ```
+- Sample CSV and template files live in `examples/` (e.g. `examples/example_contacts.csv`, `examples/example_email.txt`).
 
-   ```csv
-   email,first_name,project
-   alice@example.com,Alice,Apollo
-   bob@example.com,Bob,Zephyr
-   ```
+### 2. Write your message template
+- Use `$variable` placeholders that match the CSV headers.
+- Plain text example (`body.txt`):
+  ```text
+  Hi $first_name,
 
-   Sample CSV and template files are provided under `examples/` (e.g. `examples/example_contacts.csv`, `examples/example_email.txt`).
+  Thanks for your work on $project.
 
-2. Create a message body template (plain text or HTML) using `$variable` placeholders. Example `body.txt`:
+  Cheers,
+  Jack
+  ```
+- Files ending in `.html` (or detected as HTML) automatically send as HTML. Plain-text HTML templates are wrapped in a minimal HTML document for consistent rendering. Use `--body-type plain` to force plain text.
 
-   ```text
-   Hi $first_name,
+### 3. Provide credentials
+- By default the CLI reads the sender address from `GMAIL_ADDRESS` and the Gmail app password from `GMAIL_APP_PASSWORD`.
+- Override them with `--sender` and `--password` if desired; omitting `--password` triggers a hidden prompt.
+- When quoting strings that contain `$`, escape the dollar sign (e.g. `--subject "Project \$project update"`) to prevent shell expansion.
 
-   Thanks for your work on $project.
+### 4. Run the CLI
 
-   Cheers,
-   Jack
-   ```
+#### Installed command
+```shell
+mailmerge recipients.csv \
+  --subject 'Project $project update' \
+  --body body.txt \
+  --dry-run
+```
 
-   When the body file ends with `.html` (or has a detected HTML MIME type) the tool now sends the email as HTML automatically. Plain-text `.html` templates are wrapped in a simple HTML document (with a basic `<head>` and charset meta tag) so they render consistently—even with attachments. Pass `--body-type plain` to force plain text if required.
+#### Direct script invocation
+```shell
+python3 mailmerge.py recipients.csv \
+  -s 'Project $project update' \
+  -b body.txt \
+  -n
+```
 
-3. Choose how to run the tool:
+Removing `--dry-run`/`-n` sends the emails. Dry runs print the full rendered message (headers + body) and use placeholder credentials.
 
-   - Installed CLI via pip:
+## Command-line reference
+Run `python3 mailmerge.py --help` or `mailmerge --help` for the complete usage text. The tables below group the most common flags.
 
-     ```shell
-     mailmerge recipients.csv --subject 'Project $project update' --body body.txt --dry-run
-     ```
-
-   - Direct script invocation:
-
-     ```shell
-     python3 mailmerge.py recipients.csv -s 'Project $project update' -b body.txt -n
-     ```
-
-   During a dry run the command prints the full rendered email (headers and body) for inspection. When `--dry-run` is used, you can omit `--sender` and `--password`; a placeholder sender address is used purely for previewing. Remove `--dry-run` to send the emails. Both entry points read the sender address from the `GMAIL_ADDRESS` environment variable and the Gmail app password from `GMAIL_APP_PASSWORD`. You can also pass `--sender` and `--password` explicitly (the password prompt hides your input if you omit `--password`). If you need to use double quotes around the subject, escape dollar signs as `\$` so your shell does not expand them.
-
-### Additional options
-
+### Core workflow
 | Short | Long | Purpose | Notes |
 | --- | --- | --- | --- |
 | `-s` | `--subject` | Subject template | Uses `$placeholders` from the CSV. |
-| `-b` | `--body` | Body template path | Reads either plain text or HTML. |
-| `-t` | `--body-type` | Body format | Auto-detects from the template path; use `plain`/`html` to override. |
-| `-a` | `--attachment` | Static attachment path(s) | Repeat the flag to add more files. Paths can include `$placeholders` and are resolved relative to the CSV file. |
-| `-A` | `--attachment-column` | Per-recipient attachments | Column can contain comma/semicolon delimited paths. |
+| `-b` | `--body` | Body template path | Supports plain text and HTML. |
+| `-t` | `--body-type` | Body format | Auto-detected; override with `plain` or `html`. |
+| `-n` | `--dry-run` | Preview emails without sending | Prints rendered messages to stdout. |
+
+### Recipients and routing
+| Short | Long | Purpose | Notes |
+| --- | --- | --- | --- |
+| `-c` | `--recipient-column` | Choose the recipient address column | Defaults to `email`. |
+|  | `--cc` | Additional Cc recipients | Repeatable; accepts comma/semicolon lists and `$placeholders`. |
+|  | `--bcc` | Additional Bcc recipients | Repeatable; accepts comma/semicolon lists and `$placeholders`. |
+|  | `--cc-column` | Column containing per-recipient Cc values | Values can include comma/semicolon separated addresses. |
+|  | `--bcc-column` | Column containing per-recipient Bcc values | Values can include comma/semicolon separated addresses. |
+| `-r` | `--reply-to` | Add a Reply-To header | Useful for directing responses elsewhere. |
+
+### Attachments
+| Short | Long | Purpose | Notes |
+| --- | --- | --- | --- |
+| `-a` | `--attachment` | Attach the same file for everyone | Repeat the flag to add multiple files. Paths can include `$placeholders`. |
+| `-A` | `--attachment-column` | Attach per-recipient files | Column values can contain comma/semicolon separated paths. Paths resolve relative to the CSV. |
+
+### Credentials and SMTP
+| Short | Long | Purpose | Notes |
+| --- | --- | --- | --- |
 | `-f` | `--sender` | Sender email address | Defaults to `$GMAIL_ADDRESS`. |
-| `-p` | `--password` | App password | Defaults to `$GMAIL_APP_PASSWORD`; prompts if omitted. |
-| `-c` | `--recipient-column` | Recipient address column | Falls back to `email`. |
-|  | `--cc` | Additional Cc recipients | Repeatable; accepts comma/semicolon lists and supports `$placeholders`. |
-|  | `--bcc` | Additional Bcc recipients | Repeatable; accepts comma/semicolon lists and supports `$placeholders`. |
-|  | `--cc-column` | Per-recipient Cc column | Column values can contain comma/semicolon separated addresses. |
-|  | `--bcc-column` | Per-recipient Bcc column | Column values can contain comma/semicolon separated addresses. |
-| `-r` | `--reply-to` | Reply-To header | Adds a Reply-To address to outgoing emails. |
+| `-p` | `--password` | Gmail app password | Defaults to `$GMAIL_APP_PASSWORD`; prompts if omitted. |
 | `-S` | `--smtp-server` | SMTP host | Defaults to `smtp.gmail.com`. |
 | `-P` | `--smtp-port` | SMTP port | Defaults to `587` (STARTTLS). |
-| `-d` | `--delay` | Delay between emails | Useful to avoid rate limits (e.g. `-d 1.5`). |
-| `-l` | `--limit` | Limit number of recipients processed | Helpful for quick tests. |
+
+### Delivery controls
+| Short | Long | Purpose | Notes |
+| --- | --- | --- | --- |
+| `-d` | `--delay` | Delay between emails | Helps avoid rate limits (e.g. `-d 1.5`). |
+| `-l` | `--limit` | Process only the first N recipients | Handy for quick tests. |
 | `-L` | `--log-level` | Logging verbosity | Accepts `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
-| `-n` | `--dry-run` | Preview emails without sending | Prints rendered messages to stdout. |
-|  | `--schedule` | Install command in crontab | Provide a cron expression (`0 9 * * 1-5`), an `@daily`/`@hourly` macro, or an ISO time like `09:30` / `2024-06-05T09:30`. |
-|  | `--schedule-backend` | Scheduler backend | `auto` (default), `cron`, `launchd` (macOS), or `systemd` (Linux). |
-|  | `--schedule-timezone` | Timezone for ISO schedules | IANA tz name (e.g. `Europe/London`) used when parsing ISO times/dates. |
-|  | `--schedule-label` | Cron entry identifier | Defaults to the CSV file stem; combine with `--schedule-overwrite`. |
-|  | `--schedule-overwrite` | Replace existing cron entry | Updates the cron job that matches `--schedule-label`. |
-|  | `--schedule-remove` | Delete a specific scheduled entry | Pass the label that was used when scheduling (prior to sanitisation). |
-|  | `--schedule-list` | Show scheduled entries | Lists labels, schedules, and next run times for the selected backend. Use with `--schedule-label` to filter. |
-|  | `--schedule-remove-all` | Delete mailmerge entries | Removes every scheduled entry created by this tool for the selected backend. |
 
-Run `python3 mailmerge.py --help` to see the full list of flags.
+### Scheduling
+| Short | Long | Purpose | Notes |
+| --- | --- | --- | --- |
+|  | `--schedule` | Register the command with a scheduler | Accepts cron expressions, ISO times (`09:30`), or ISO datetimes (`2024-06-05T09:30`). |
+|  | `--schedule-backend` | Choose scheduler backend | `auto` (default), `cron`, `launchd` (macOS), or `systemd` (Linux). |
+|  | `--schedule-timezone` | Interpret ISO schedules in a specific timezone | Provide an IANA tz name (e.g. `Europe/London`). |
+|  | `--schedule-label` | Name for the scheduled job | Defaults to the CSV stem; combine with `--schedule-overwrite`. |
+|  | `--schedule-overwrite` | Replace an existing job with the same label | Useful for updates. |
+|  | `--schedule-list` | Show scheduled entries | Combine with `--schedule-label` to filter results. |
+|  | `--schedule-remove` | Delete a specific scheduled job | Pass the original label. |
+|  | `--schedule-remove-all` | Remove every mailmerge job for the selected backend | Good for cleanup. |
 
-### Scheduling with cron, launchd, or systemd
+## Scheduling workflows
 
-Use `--schedule` to register the current invocation so the emails deliver later from the same machine. By default the tool auto-detects the scheduler (launchd on macOS, systemd on Linux when `systemctl` is available, otherwise cron). Pass `--schedule-backend cron` (or `launchd` / `systemd`) to override this behaviour explicitly. A lightweight state file ensures each job runs at most once per scheduled slot and enables catch-up for launchd/systemd when the original time was missed (plain cron still skips runs while the machine is off):
+Use `--schedule` to run the same command automatically later. The tool auto-detects the best backend (launchd on macOS, systemd on Linux when `systemctl` exists, otherwise cron) and stores lightweight state files to avoid duplicate sends. Plain cron jobs still skip runs while the machine is off.
 
+### Example: weekday cron entry
 ```shell
 mailmerge recipients.csv \
   --subject 'Project $project update' \
   --body body.txt \
   --sender you@example.com \
   --password 'your app password' \
-  --schedule "0 9 * * 1-5" \
+  --schedule '0 9 * * 1-5' \
   --schedule-label project-updates
 ```
+- ISO times (`--schedule 09:30`) run daily at the given local time; ISO datetimes repeat yearly.
+- Convert ISO schedules from another timezone with `--schedule-timezone Europe/London`.
+- Jobs are stored as a two-line block in `crontab -l`. Re-run with `--schedule-overwrite` to update the command.
+- Ensure the cron environment exports `GMAIL_ADDRESS` and `GMAIL_APP_PASSWORD` if you do not hard-code `--sender`/`--password`.
 
-Instead of a cron expression you can also use ISO 8601 times (`--schedule 09:30` to send daily at 09:30) or datetimes (`--schedule 2024-06-05T09:30`). Use `--schedule-timezone` when the ISO value should be interpreted in a specific timezone—mailmerge converts it to the machine’s local timezone before writing the cron entry (e.g. `--schedule 09:30 --schedule-timezone Europe/London`). For ISO datetimes, cron repeats the job yearly on the same calendar date—delete the entry after it runs if you only need a one-off. The command stores a two-line block in `crontab -l`: a marker comment and the full mailmerge command. Re-running with the same `--schedule-label` and `--schedule-overwrite` refreshes the job. If you omit `--sender` or `--password`, ensure the cron environment exports `GMAIL_ADDRESS` and `GMAIL_APP_PASSWORD` before the job runs. The machine must stay powered, logged in, and connected to the internet at the scheduled time. Inspect scheduled jobs with `mailmerge --schedule-list` (optionally combine with `--schedule-label label-name` to filter), remove a single job with `mailmerge --schedule-remove project-updates` (labels are sanitised automatically), or wipe every mailmerge entry with `mailmerge --schedule-remove-all` (or via `crontab -e` to delete the comment/command pair manually).
+**Python 3.8 note:** install `backports.zoneinfo` or `pytz` if you use `--schedule-timezone`.
 
-> **Note:** Python 3.8 users need either `backports.zoneinfo` or `pytz` to resolve IANA timezones (e.g. `python3 -m pip install backports.zoneinfo` or `python3 -m pip install pytz`).
+### macOS launchd catch-up scheduling
+- Set `--schedule-backend launchd` for wake-from-sleep catch-up behaviour.
+- Creates `~/Library/LaunchAgents/com.gmailmailmerge.<label>.plist` and logs to `~/Library/Logs/com.gmailmailmerge.<label>.log`.
+- Only fixed minute/hour (and optional month/day or weekday) values are supported—ranges like `*/5` are not.
+- Launchd retries failed runs automatically with at least 60 seconds between attempts.
 
-#### macOS launchd catch-up scheduling
-
-On macOS you can switch to `launchd`, which retries soon after the laptop wakes up if it was asleep at the scheduled time:
-
+Example:
 ```shell
 mailmerge recipients.csv \
   --subject 'Project $project update' \
@@ -131,13 +175,12 @@ mailmerge recipients.csv \
   --schedule-label project-updates
 ```
 
-The tool installs `~/Library/LaunchAgents/com.gmailmailmerge.<label>.plist` and logs to `~/Library/Logs/com.gmailmailmerge.<label>.log`. launchd only accepts fixed minute/hour (and optional month/day or weekday) values—ranges such as `*/5` are not supported here. If the Mac was asleep or powered off when the scheduled time passed, the job runs once shortly after the machine wakes thanks to the stored schedule state. Display launchd jobs with `mailmerge --schedule-backend launchd --schedule-list` (combine with `--schedule-label` to filter), remove one with `mailmerge --schedule-backend launchd --schedule-remove project-updates`, or clear every mailmerge job with `mailmerge --schedule-backend launchd --schedule-remove-all`.
-If the mailmerge process exits with an error, launchd automatically retries it with at least 60 seconds between attempts.
+### Linux systemd timers with catch-up
+- Select `--schedule-backend systemd` to generate user units in `~/.config/systemd/user`.
+- Units use `Persistent=true`, so missed runs execute once at the next login/boot.
+- Requires `systemctl`; the CLI runs `systemctl --user enable --now` for you.
 
-#### Linux systemd timers with catch-up
-
-On Linux you can target systemd, which writes user units under `~/.config/systemd/user` and enables `Persistent=true` so missed runs fire immediately at boot/login:
-
+Example:
 ```shell
 mailmerge recipients.csv \
   --subject 'Project $project update' \
@@ -149,16 +192,14 @@ mailmerge recipients.csv \
   --schedule-label project-updates
 ```
 
-This creates `mailmerge-project-updates.service` and `.timer`, runs `systemctl --user enable --now`, and expects `systemctl` to be available. As with launchd, supply explicit minute/hour values (and optionally month/day *or* weekday). The timer is configured with `Persistent=true`, so a missed run fires once at the next login/boot. Inspect timers with `mailmerge --schedule-backend systemd --schedule-list`, check the timer with `systemctl --user status mailmerge-project-updates.timer`, remove a specific job with `mailmerge --schedule-backend systemd --schedule-remove project-updates`, or clear every mailmerge timer with `mailmerge --schedule-backend systemd --schedule-remove-all` (or rely on the default `auto`, which will choose systemd on Linux).
+### Manage scheduled jobs
+- List auto-detected jobs: `mailmerge --schedule-list`
+- Show launchd jobs: `mailmerge --schedule-backend launchd --schedule-list`
+- Remove one job: `mailmerge --schedule-remove project-updates`
+- Remove a specific launchd job: `mailmerge --schedule-backend launchd --schedule-remove project-updates`
+- Remove everything for the current backend: `mailmerge --schedule-remove-all`
+- Clean all launchd jobs: `mailmerge --schedule-backend launchd --schedule-remove-all`
+- Clean all systemd jobs: `mailmerge --schedule-backend systemd --schedule-remove-all`
 
-To delete every scheduled entry previously added by mailmerge without touching any other jobs, run:
-
-```shell
-mailmerge --schedule-list                                        # list jobs for the auto-detected backend
-mailmerge --schedule-backend launchd --schedule-list             # list launchd jobs
-mailmerge --schedule-remove project-updates                      # remove one label (backend auto)
-mailmerge --schedule-backend launchd --schedule-remove project-updates   # remove a launchd job for label 'project-updates'
-mailmerge --schedule-remove-all                                  # remove every mailmerge job (auto backend)
-mailmerge --schedule-backend launchd --schedule-remove-all       # macOS launchd
-mailmerge --schedule-backend systemd --schedule-remove-all       # Linux systemd
-```
+## Examples
+Explore `examples/` for a ready-made CSV, plain-text template, and HTML template to adapt for your campaign. They pair well with `--dry-run` while experimenting.
