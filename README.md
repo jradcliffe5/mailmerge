@@ -18,7 +18,7 @@ python3 -m pip install .
 To produce distributable artefacts, run `python3 -m build` and then install the wheel:
 
 ```shell
-python3 -m pip install dist/gmail_mailmerge-0.5.0-py3-none-any.whl
+python3 -m pip install dist/gmail_mailmerge-0.9.0-py3-none-any.whl
 ```
 
 After installation, invoke the CLI with `mailmerge --help` or `python3 -m mailmerge_cli`. If you prefer not to install the package, you can run the bundled script directly with `python3 mailmerge.py`.
@@ -44,6 +44,8 @@ After installation, invoke the CLI with `mailmerge --help` or `python3 -m mailme
    Jack
    ```
 
+   When the body file ends with `.html` (or has a detected HTML MIME type) the tool now sends the email as HTML automatically. Plain-text `.html` templates are wrapped in a simple HTML document (with a basic `<head>` and charset meta tag) so they render consistently—even with attachments. Pass `--body-type plain` to force plain text if required.
+
 3. Choose how to run the tool:
 
    - Installed CLI via pip:
@@ -66,7 +68,7 @@ After installation, invoke the CLI with `mailmerge --help` or `python3 -m mailme
 | --- | --- | --- | --- |
 | `-s` | `--subject` | Subject template | Uses `$placeholders` from the CSV. |
 | `-b` | `--body` | Body template path | Reads either plain text or HTML. |
-| `-t` | `--body-type` | Body format | Use `html` to send HTML emails (default is plain text). |
+| `-t` | `--body-type` | Body format | Auto-detects from the template path; use `plain`/`html` to override. |
 | `-a` | `--attachment` | Static attachment path(s) | Repeat the flag to add more files. Paths can include `$placeholders` and are resolved relative to the CSV file. |
 | `-A` | `--attachment-column` | Per-recipient attachments | Column can contain comma/semicolon delimited paths. |
 | `-f` | `--sender` | Sender email address | Defaults to `$GMAIL_ADDRESS`. |
@@ -88,6 +90,8 @@ After installation, invoke the CLI with `mailmerge --help` or `python3 -m mailme
 |  | `--schedule-timezone` | Timezone for ISO schedules | IANA tz name (e.g. `Europe/London`) used when parsing ISO times/dates. |
 |  | `--schedule-label` | Cron entry identifier | Defaults to the CSV file stem; combine with `--schedule-overwrite`. |
 |  | `--schedule-overwrite` | Replace existing cron entry | Updates the cron job that matches `--schedule-label`. |
+|  | `--schedule-remove` | Delete a specific scheduled entry | Pass the label that was used when scheduling (prior to sanitisation). |
+|  | `--schedule-list` | Show scheduled entries | Lists labels, schedules, and next run times for the selected backend. Use with `--schedule-label` to filter. |
 |  | `--schedule-remove-all` | Delete mailmerge entries | Removes every scheduled entry created by this tool for the selected backend. |
 
 Run `python3 mailmerge.py --help` to see the full list of flags.
@@ -106,7 +110,7 @@ mailmerge recipients.csv \
   --schedule-label project-updates
 ```
 
-Instead of a cron expression you can also use ISO 8601 times (`--schedule 09:30` to send daily at 09:30) or datetimes (`--schedule 2024-06-05T09:30`). Use `--schedule-timezone` when the ISO value should be interpreted in a specific timezone—mailmerge converts it to the machine’s local timezone before writing the cron entry (e.g. `--schedule 09:30 --schedule-timezone Europe/London`). For ISO datetimes, cron repeats the job yearly on the same calendar date—delete the entry after it runs if you only need a one-off. The command stores a two-line block in `crontab -l`: a marker comment and the full mailmerge command. Re-running with the same `--schedule-label` and `--schedule-overwrite` refreshes the job. If you omit `--sender` or `--password`, ensure the cron environment exports `GMAIL_ADDRESS` and `GMAIL_APP_PASSWORD` before the job runs. The machine must stay powered, logged in, and connected to the internet at the scheduled time. Remove the job later with `mailmerge --schedule-remove-all` (or via `crontab -e` to delete the comment/command pair manually).
+Instead of a cron expression you can also use ISO 8601 times (`--schedule 09:30` to send daily at 09:30) or datetimes (`--schedule 2024-06-05T09:30`). Use `--schedule-timezone` when the ISO value should be interpreted in a specific timezone—mailmerge converts it to the machine’s local timezone before writing the cron entry (e.g. `--schedule 09:30 --schedule-timezone Europe/London`). For ISO datetimes, cron repeats the job yearly on the same calendar date—delete the entry after it runs if you only need a one-off. The command stores a two-line block in `crontab -l`: a marker comment and the full mailmerge command. Re-running with the same `--schedule-label` and `--schedule-overwrite` refreshes the job. If you omit `--sender` or `--password`, ensure the cron environment exports `GMAIL_ADDRESS` and `GMAIL_APP_PASSWORD` before the job runs. The machine must stay powered, logged in, and connected to the internet at the scheduled time. Inspect scheduled jobs with `mailmerge --schedule-list` (optionally combine with `--schedule-label label-name` to filter), remove a single job with `mailmerge --schedule-remove project-updates` (labels are sanitised automatically), or wipe every mailmerge entry with `mailmerge --schedule-remove-all` (or via `crontab -e` to delete the comment/command pair manually).
 
 > **Note:** Python 3.8 users need either `backports.zoneinfo` or `pytz` to resolve IANA timezones (e.g. `python3 -m pip install backports.zoneinfo` or `python3 -m pip install pytz`).
 
@@ -125,7 +129,8 @@ mailmerge recipients.csv \
   --schedule-label project-updates
 ```
 
-The tool installs `~/Library/LaunchAgents/com.gmailmailmerge.<label>.plist` and logs to `~/Library/Logs/com.gmailmailmerge.<label>.log`. launchd only accepts fixed minute/hour (and optional month/day or weekday) values—ranges such as `*/5` are not supported here. If the Mac was asleep or powered off when the scheduled time passed, the job runs once shortly after the machine wakes thanks to the stored schedule state. Remove the job later with `mailmerge --schedule-backend launchd --schedule-remove-all` (or provide a different label and overwrite it).
+The tool installs `~/Library/LaunchAgents/com.gmailmailmerge.<label>.plist` and logs to `~/Library/Logs/com.gmailmailmerge.<label>.log`. launchd only accepts fixed minute/hour (and optional month/day or weekday) values—ranges such as `*/5` are not supported here. If the Mac was asleep or powered off when the scheduled time passed, the job runs once shortly after the machine wakes thanks to the stored schedule state. Display launchd jobs with `mailmerge --schedule-backend launchd --schedule-list` (combine with `--schedule-label` to filter), remove one with `mailmerge --schedule-backend launchd --schedule-remove project-updates`, or clear every mailmerge job with `mailmerge --schedule-backend launchd --schedule-remove-all`.
+If the mailmerge process exits with an error, launchd automatically retries it with at least 60 seconds between attempts.
 
 #### Linux systemd timers with catch-up
 
@@ -142,12 +147,16 @@ mailmerge recipients.csv \
   --schedule-label project-updates
 ```
 
-This creates `mailmerge-project-updates.service` and `.timer`, runs `systemctl --user enable --now`, and expects `systemctl` to be available. As with launchd, supply explicit minute/hour values (and optionally month/day *or* weekday). The timer is configured with `Persistent=true`, so a missed run fires once at the next login/boot. Check the timer with `systemctl --user status mailmerge-project-updates.timer` and remove all mailmerge timers with `mailmerge --schedule-backend systemd --schedule-remove-all` (or rely on the default `auto`, which will choose systemd on Linux).
+This creates `mailmerge-project-updates.service` and `.timer`, runs `systemctl --user enable --now`, and expects `systemctl` to be available. As with launchd, supply explicit minute/hour values (and optionally month/day *or* weekday). The timer is configured with `Persistent=true`, so a missed run fires once at the next login/boot. Inspect timers with `mailmerge --schedule-backend systemd --schedule-list`, check the timer with `systemctl --user status mailmerge-project-updates.timer`, remove a specific job with `mailmerge --schedule-backend systemd --schedule-remove project-updates`, or clear every mailmerge timer with `mailmerge --schedule-backend systemd --schedule-remove-all` (or rely on the default `auto`, which will choose systemd on Linux).
 
 To delete every scheduled entry previously added by mailmerge without touching any other jobs, run:
 
 ```shell
-mailmerge --schedule-remove-all                                  # uses auto-detected backend
+mailmerge --schedule-list                                        # list jobs for the auto-detected backend
+mailmerge --schedule-backend launchd --schedule-list             # list launchd jobs
+mailmerge --schedule-remove project-updates                      # remove one label (backend auto)
+mailmerge --schedule-backend launchd --schedule-remove project-updates   # remove a launchd job for label 'project-updates'
+mailmerge --schedule-remove-all                                  # remove every mailmerge job (auto backend)
 mailmerge --schedule-backend launchd --schedule-remove-all       # macOS launchd
 mailmerge --schedule-backend systemd --schedule-remove-all       # Linux systemd
 ```

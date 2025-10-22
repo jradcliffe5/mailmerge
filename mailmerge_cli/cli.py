@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import getpass
 import hashlib
 import json
@@ -17,6 +18,7 @@ import shutil
 import smtplib
 import subprocess
 import sys
+import textwrap
 import time
 from datetime import date as dt_date, datetime, time as dt_time, timedelta, timezone, tzinfo
 from email.message import EmailMessage
@@ -39,6 +41,7 @@ except ImportError:  # pragma: no cover
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    """Parse CLI arguments and return the populated namespace."""
     parser = argparse.ArgumentParser(
         description="Send a mail merge to multiple recipients via Gmail SMTP.",
         formatter_class=argparse.RawTextHelpFormatter,
@@ -81,9 +84,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "-t",
         "--body-type",
-        choices=("plain", "html"),
-        default="plain",
-        help="Content type for the email body. Defaults to plain text.",
+        choices=("auto", "plain", "html"),
+        default="auto",
+        help="Content type for the email body. Defaults to auto-detect based on the template path.",
     )
     parser.add_argument(
         "-a",
@@ -246,6 +249,21 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Replace an existing cron entry that uses the same schedule label.",
     )
     parser.add_argument(
+        "--schedule-remove",
+        metavar="LABEL",
+        help=(
+            "Remove the scheduled entry with the given label for the selected backend. "
+            "Matches the value used with --schedule-label (sanitised to scheduler-safe characters)."
+        ),
+    )
+    parser.add_argument(
+        "--schedule-list",
+        action="store_true",
+        help=(
+            "List mailmerge jobs installed for the selected backend, including labels and next scheduled run."
+        ),
+    )
+    parser.add_argument(
         "--schedule-remove-all",
         action="store_true",
         help=(
@@ -266,6 +284,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 
 def load_recipients(csv_path: Path) -> List[dict]:
+    """Load recipient rows from the given CSV path."""
     if not csv_path.is_file():
         raise FileNotFoundError(f"CSV file not found: {csv_path}")
 
@@ -277,17 +296,89 @@ def load_recipients(csv_path: Path) -> List[dict]:
 
 
 def read_template(path: Path) -> Template:
+    """Read a text/HTML template and return a string.Template."""
     if not path.is_file():
         raise FileNotFoundError(f"Template file not found: {path}")
     content = path.read_text(encoding="utf-8")
     return Template(content)
 
 
+def resolve_body_subtype(body_type: str, body_path: Path) -> str:
+    """Determine the email body subtype (plain/html) using flags and file hints."""
+    if body_type != "auto":
+        return body_type
+    guessed_type, _ = mimetypes.guess_type(str(body_path))
+    if guessed_type and guessed_type.lower() == "text/html":
+        return "html"
+    if body_path.suffix.lower() in {".html", ".htm", ".xhtml"}:
+        return "html"
+    return "plain"
+
+
+def normalize_html_body(body: str) -> str:
+    """Wrap incomplete HTML snippets with a minimal document skeleton."""
+    if re.search(r"<[A-Za-z!/][^>]*>", body):
+        stripped = body.strip()
+        if not stripped:
+            return "<!DOCTYPE html>\n<html>\n  <head>\n    <meta charset=\"utf-8\">\n  </head>\n  <body></body>\n</html>"
+        lowered = stripped.lower()
+        document = stripped
+        if "<html" not in lowered:
+            indented = textwrap.indent(stripped, "    ")
+            return (
+                "<!DOCTYPE html>\n"
+                "<html>\n"
+                "  <head>\n"
+                "    <meta charset=\"utf-8\">\n"
+                "  </head>\n"
+                "  <body>\n"
+                f"{indented}\n"
+                "  </body>\n"
+                "</html>"
+            )
+        if "<head" not in lowered:
+            html_match = re.search(r"<html[^>]*>", document, flags=re.IGNORECASE)
+            if html_match:
+                insertion = html_match.end()
+                document = (
+                    document[:insertion]
+                    + "\n  <head>\n    <meta charset=\"utf-8\">\n  </head>"
+                    + document[insertion:]
+                )
+        return document
+    stripped = body.strip()
+    if not stripped:
+        return "<!DOCTYPE html>\n<html>\n  <head>\n    <meta charset=\"utf-8\">\n  </head>\n  <body></body>\n</html>"
+    paragraphs = []
+    for chunk in body.split("\n\n"):
+        if not chunk.strip():
+            continue
+        lines = chunk.rstrip("\n").splitlines()
+        content = "<br>".join(html.escape(line) for line in lines)
+        paragraphs.append(f"<p>{content}</p>")
+    if not paragraphs:
+        paragraphs.append("<p></p>")
+    joined = "\n    ".join(paragraphs)
+    return (
+        "<!DOCTYPE html>\n"
+        "<html>\n"
+        "  <head>\n"
+        "    <meta charset=\"utf-8\">\n"
+        "  </head>\n"
+        "  <body>\n"
+        f"    {joined}\n"
+        "  </body>\n"
+        "</html>"
+    )
+
+
 def parse_addresses(raw: str) -> List[str]:
+    """Split comma/semicolon delimited recipient strings into discrete addresses."""
     return [addr.strip() for addr in raw.replace(";", ",").split(",") if addr.strip()]
 
 
 def parse_list_entries(raw: str | None) -> List[str]:
+    """Split comma/semicolon delimited values while ignoring empty entries."""
     if not raw:
         return []
     return [value.strip() for value in raw.replace(";", ",").split(",") if value.strip()]
@@ -305,6 +396,7 @@ def build_message(
     bcc: Sequence[str] | None = None,
     attachments: Sequence[Tuple[str, bytes, str, str]] | None = None,
 ) -> EmailMessage:
+    """Compose an EmailMessage with optional reply-to, CC/BCC, and attachments."""
     message = EmailMessage()
     message["From"] = sender
     message["To"] = ", ".join(recipients)
@@ -334,12 +426,14 @@ SYSTEMD_UNIT_PREFIX = "mailmerge-"
 
 
 def sanitize_label_seed(value: str) -> str:
+    """Convert a user-provided label to a scheduler-friendly identifier."""
     sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "-", value)
     sanitized = sanitized.strip(".-")
     return sanitized or "mailmerge"
 
 
 def build_program_arguments(args: argparse.Namespace, *, schedule_spec: str | None = None, state_path: Path | None = None) -> List[str]:
+    """Reconstruct the CLI invocation with explicit flags for scheduler backends."""
     command: List[str] = [
         sys.executable,
         "-m",
@@ -411,11 +505,13 @@ def build_program_arguments(args: argparse.Namespace, *, schedule_spec: str | No
 
 
 def build_cron_command(args: argparse.Namespace, *, schedule_spec: str | None = None, state_path: Path | None = None) -> str:
+    """Convert program arguments into a single shell-safe cron command string."""
     parts = build_program_arguments(args, schedule_spec=schedule_spec, state_path=state_path)
     return " ".join(shlex.quote(part) for part in parts)
 
 
 def read_crontab_lines() -> List[str]:
+    """Return the current user's crontab as a list of lines."""
     result = subprocess.run(
         ["crontab", "-l"],
         check=False,
@@ -432,6 +528,7 @@ def read_crontab_lines() -> List[str]:
 
 
 def write_crontab_lines(lines: Sequence[str]) -> None:
+    """Replace the current user's crontab contents with the provided lines."""
     new_content = "\n".join(lines).rstrip("\n") + "\n"
     result = subprocess.run(
         ["crontab", "-"],
@@ -446,6 +543,7 @@ def write_crontab_lines(lines: Sequence[str]) -> None:
 
 
 def resolve_schedule_timezone(name: str | None) -> tzinfo | None:
+    """Resolve a timezone identifier via zoneinfo/backports/pytz."""
     if not name:
         return None
     if ZoneInfo is None:
@@ -474,6 +572,7 @@ def resolve_schedule_timezone(name: str | None) -> tzinfo | None:
 
 
 def describe_timezone(zone: tzinfo | None) -> str:
+    """Return a human-readable name for the supplied timezone."""
     if zone is None:
         return "UTC"
     key = getattr(zone, "key", None)
@@ -489,12 +588,14 @@ def describe_timezone(zone: tzinfo | None) -> str:
 
 
 def ensure_timezone(zone: tzinfo | None) -> tzinfo:
+    """Guarantee a tzinfo object, falling back to UTC."""
     if zone is None:
         return timezone.utc
     return zone
 
 
 def ensure_datetime_timezone(dt_value: datetime, zone: tzinfo | None) -> datetime:
+    """Attach or convert timezone information on a datetime instance."""
     if dt_value.tzinfo is not None:
         if zone is None:
             return dt_value
@@ -507,6 +608,7 @@ def ensure_datetime_timezone(dt_value: datetime, zone: tzinfo | None) -> datetim
 
 
 def combine_time_with_timezone(date_value: dt_date, time_value: dt_time, zone: tzinfo | None) -> datetime:
+    """Combine separate date/time inputs and apply the desired timezone."""
     if time_value.tzinfo is not None:
         naive_time = time_value.replace(tzinfo=None)
         base_dt = datetime.combine(date_value, naive_time)
@@ -516,6 +618,7 @@ def combine_time_with_timezone(date_value: dt_date, time_value: dt_time, zone: t
 
 
 def require_backend_supported(backend: str) -> None:
+    """Validate that the requested scheduler backend is supported on this platform."""
     if backend == "launchd" and sys.platform != "darwin":
         raise RuntimeError("The launchd backend is only available on macOS.")
     if backend == "systemd" and not sys.platform.startswith("linux"):
@@ -523,6 +626,7 @@ def require_backend_supported(backend: str) -> None:
 
 
 def detect_default_backend() -> str:
+    """Auto-detect the scheduling backend suited to the current platform."""
     if sys.platform == "darwin":
         return "launchd"
     if sys.platform.startswith("linux") and shutil.which("systemctl"):
@@ -531,6 +635,7 @@ def detect_default_backend() -> str:
 
 
 def determine_backend(choice: str | None) -> str:
+    """Resolve the effective scheduler backend based on user input or defaults."""
     if not choice or choice == "auto":
         backend = detect_default_backend()
     else:
@@ -540,6 +645,7 @@ def determine_backend(choice: str | None) -> str:
 
 
 def schedule_state_base_dir() -> Path:
+    """Return the platform-specific base directory for schedule state files."""
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "mailmerge"
     base_dir = Path.home() / ".local" / "share" / "mailmerge"
@@ -547,24 +653,44 @@ def schedule_state_base_dir() -> Path:
 
 
 def schedule_state_dir() -> Path:
+    """Ensure the schedule-state directory exists and return its path."""
     path = schedule_state_base_dir() / "schedule-state"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def build_state_path(label_seed: str, fingerprint: str) -> Path:
+    """Construct a deterministic state-file path from the label and command fingerprint."""
     filename = f"{label_seed}-{fingerprint}.json"
     return schedule_state_dir() / filename
 
 
 def parse_cron_value(value: str) -> int | None:
+    """Parse an individual cron field into an integer or None for wildcards."""
     if value == "*":
         return None
     parsed = int(value)
     return parsed
 
 
+def read_schedule_state_next_due(state_path: Path | None) -> datetime | None:
+    """Read the next_due value from a schedule state file if it exists."""
+    if not state_path:
+        return None
+    if not state_path.exists():
+        return None
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        next_due = data.get("next_due")
+        if next_due:
+            return datetime.fromisoformat(next_due)
+    except Exception:
+        return None
+    return None
+
+
 def cron_matches(dt_value: datetime, minute: int | None, hour: int | None, day: int | None, month: int | None, weekday: int | None) -> bool:
+    """Check whether a datetime satisfies the supplied cron component constraints."""
     if minute is not None and dt_value.minute != minute:
         return False
     if hour is not None and dt_value.hour != hour:
@@ -582,6 +708,7 @@ def cron_matches(dt_value: datetime, minute: int | None, hour: int | None, day: 
 
 
 def parse_cron_spec(cron_spec: str) -> tuple[int | None, int | None, int | None, int | None, int | None]:
+    """Split a cron expression into integer fields, returning None for wildcards."""
     minute_s, hour_s, day_s, month_s, weekday_s = cron_spec.split()
     return (
         parse_cron_value(minute_s),
@@ -593,6 +720,7 @@ def parse_cron_spec(cron_spec: str) -> tuple[int | None, int | None, int | None,
 
 
 def next_run_time(cron_spec: str, start: datetime) -> datetime:
+    """Calculate the next datetime that satisfies the cron expression after the start."""
     minute, hour, day, month, weekday = parse_cron_spec(cron_spec)
     candidate = (start + timedelta(minutes=1)).replace(second=0, microsecond=0)
     limit = candidate + timedelta(days=366)
@@ -604,6 +732,7 @@ def next_run_time(cron_spec: str, start: datetime) -> datetime:
 
 
 def initialize_schedule_state(state_path: Path, cron_spec: str, *, overwrite: bool) -> datetime:
+    """Create or reuse a schedule state file and return the next due datetime."""
     state_path.parent.mkdir(parents=True, exist_ok=True)
     if state_path.exists() and not overwrite:
         try:
@@ -626,6 +755,7 @@ def initialize_schedule_state(state_path: Path, cron_spec: str, *, overwrite: bo
 
 
 def update_schedule_state(cron_spec: str, state_path: Path) -> tuple[bool, datetime]:
+    """Advance the persisted schedule state and report whether the job is due."""
     state_path.parent.mkdir(parents=True, exist_ok=True)
     now = datetime.now().replace(second=0, microsecond=0)
     data: dict
@@ -666,6 +796,7 @@ def update_schedule_state(cron_spec: str, state_path: Path) -> tuple[bool, datet
 
 
 def remove_schedule_state(state_path: Path) -> None:
+    """Delete a persisted schedule state file, ignoring missing files."""
     try:
         state_path.unlink()
     except FileNotFoundError:
@@ -673,6 +804,7 @@ def remove_schedule_state(state_path: Path) -> None:
 
 
 def remove_schedule_state_by_label(label_seed: str) -> int:
+    """Remove every stored schedule state JSON that matches the label seed."""
     state_dir = schedule_state_dir()
     count = 0
     for path in state_dir.glob(f"{label_seed}-*.json"):
@@ -685,6 +817,7 @@ def remove_schedule_state_by_label(label_seed: str) -> int:
 
 
 def extract_state_path_from_arguments(arguments: Sequence[str]) -> Path | None:
+    """Find the value provided after --schedule-state within an argument list."""
     for index, value in enumerate(arguments):
         if value == "--schedule-state" and index + 1 < len(arguments):
             return Path(arguments[index + 1]).expanduser()
@@ -692,6 +825,7 @@ def extract_state_path_from_arguments(arguments: Sequence[str]) -> Path | None:
 
 
 def extract_state_path_from_command_line(command_line: str) -> Path | None:
+    """Parse a command line string and locate a --schedule-state argument."""
     try:
         tokens = shlex.split(command_line)
     except ValueError:
@@ -699,7 +833,8 @@ def extract_state_path_from_command_line(command_line: str) -> Path | None:
     return extract_state_path_from_arguments(tokens)
 
 
-def prepare_schedule(args: argparse.Namespace) -> tuple[str, str, tzinfo, tzinfo]:
+def prepare_schedule(args: argparse.Namespace) -> tuple[str, str, tzinfo, tzinfo | None]:
+    """Normalize schedule arguments into cron syntax plus timezone metadata."""
     if not args.schedule:
         raise ValueError("Schedule string is required.")
     schedule_text = args.schedule.strip()
@@ -720,6 +855,7 @@ def prepare_schedule(args: argparse.Namespace) -> tuple[str, str, tzinfo, tzinfo
 
 
 def _parse_numeric_field(field: str, name: str, *, allow_wildcard: bool = True) -> int | None:
+    """Convert a cron field to an integer, optionally allowing '*' wildcards."""
     if field == "*":
         if allow_wildcard:
             return None
@@ -732,6 +868,7 @@ def _parse_numeric_field(field: str, name: str, *, allow_wildcard: bool = True) 
 
 
 def cron_to_launchd_interval(cron_spec: str) -> dict:
+    """Translate a cron spec to launchd's dictionary-based interval structure."""
     minute, hour, day, month, weekday = cron_spec.split()
     minute_value = _parse_numeric_field(minute, "minute", allow_wildcard=False)
     hour_value = _parse_numeric_field(hour, "hour", allow_wildcard=False)
@@ -744,7 +881,7 @@ def cron_to_launchd_interval(cron_spec: str) -> dict:
             "launchd backend does not support combining specific days-of-month and weekdays simultaneously."
         )
 
-    interval: dict[str, int] = {"Minute": minute_value, "Hour": hour_value}
+    interval: dict[str, int] = {"Minute": minute_value, "Hour": hour_value}  # type: ignore[assignment]
     if day_value is not None:
         interval["Day"] = day_value
     if month_value is not None:
@@ -755,6 +892,7 @@ def cron_to_launchd_interval(cron_spec: str) -> dict:
 
 
 def cron_to_systemd_calendar(cron_spec: str) -> str:
+    """Convert a cron expression to systemd's calendar format."""
     minute, hour, day, month, weekday = cron_spec.split()
     minute_value = _parse_numeric_field(minute, "minute", allow_wildcard=False)
     hour_value = _parse_numeric_field(hour, "hour", allow_wildcard=False)
@@ -794,6 +932,7 @@ def cron_to_systemd_calendar(cron_spec: str) -> str:
 
 
 def normalize_schedule(schedule: str, tz_hint: tzinfo | None, local_zone: tzinfo) -> tuple[str, str]:
+    """Normalise a schedule expression and return the canonical cron string plus a display string."""
     cleaned = schedule.strip()
     if not cleaned or any(char in cleaned for char in "\r\n"):
         raise ValueError("Schedule expression must be a single non-empty line.")
@@ -815,6 +954,7 @@ def normalize_schedule(schedule: str, tz_hint: tzinfo | None, local_zone: tzinfo
 
 
 def convert_iso_to_cron(value: str, tz_hint: tzinfo | None, local_zone: tzinfo) -> str | None:
+    """Translate ISO 8601 times/datetimes into cron expressions relative to the local zone."""
     candidate = value.strip()
     if candidate.endswith("Z") and candidate.count("Z") == 1:
         candidate = candidate[:-1] + "+00:00"
@@ -850,6 +990,7 @@ def convert_iso_to_cron(value: str, tz_hint: tzinfo | None, local_zone: tzinfo) 
 
 
 def install_cron_job(args: argparse.Namespace) -> None:
+    """Install or update the cron entry for the requested schedule."""
     cron_spec, display_schedule, local_zone, _ = prepare_schedule(args)
 
     label_seed = args.schedule_label or args.csv.stem or "mailmerge"
@@ -910,6 +1051,7 @@ def install_cron_job(args: argparse.Namespace) -> None:
 
 
 def install_launchd_job(args: argparse.Namespace) -> None:
+    """Create or overwrite the launchd plist/timer for a scheduled mail merge."""
     require_backend_supported("launchd")
     cron_spec, display_schedule, local_zone, _ = prepare_schedule(args)
     interval = cron_to_launchd_interval(cron_spec)
@@ -950,6 +1092,8 @@ def install_launchd_job(args: argparse.Namespace) -> None:
         "Label": label,
         "ProgramArguments": program_args,
         "RunAtLoad": True,
+        "KeepAlive": {"SuccessfulExit": False},
+        "ThrottleInterval": 60,
         "StartCalendarInterval": interval,
         "StandardOutPath": str(log_path),
         "StandardErrorPath": str(log_path),
@@ -994,6 +1138,7 @@ def install_launchd_job(args: argparse.Namespace) -> None:
 
 
 def install_systemd_job(args: argparse.Namespace) -> None:
+    """Create or refresh the systemd service/timer pair for scheduled runs."""
     require_backend_supported("systemd")
     if shutil.which("systemctl") is None:
         raise RuntimeError("systemctl not found. The systemd backend requires systemctl to manage timers.")
@@ -1117,7 +1262,9 @@ def install_systemd_job(args: argparse.Namespace) -> None:
         )
 
 
-def remove_mailmerge_cron_jobs() -> int:
+def remove_mailmerge_cron_jobs(label: str | None = None) -> int:
+    """Remove cron entries created by this tool, optionally filtered by label."""
+    target_label = sanitize_label_seed(label) if label else None
     lines = read_crontab_lines()
     if not lines:
         return 0
@@ -1136,6 +1283,14 @@ def remove_mailmerge_cron_jobs() -> int:
                 fingerprint = match.group(2)
 
             command_line = lines[index + 1] if index + 1 < len(lines) else ""
+
+            if target_label and label_seed != target_label:
+                new_lines.append(line)
+                if index + 1 < len(lines):
+                    new_lines.append(lines[index + 1])
+                index += 2
+                continue
+
             state_path = extract_state_path_from_command_line(command_line)
             if state_path is not None:
                 remove_schedule_state(state_path)
@@ -1160,7 +1315,57 @@ def remove_mailmerge_cron_jobs() -> int:
     return removed_jobs
 
 
-def remove_launchd_jobs() -> int:
+def list_cron_jobs(label: str | None = None) -> List[dict]:
+    """List cron-based mailmerge jobs, optionally filtered by label."""
+    target_label = sanitize_label_seed(label) if label else None
+    lines = read_crontab_lines()
+    jobs: List[dict] = []
+    index = 0
+    now = datetime.now().replace(second=0, microsecond=0)
+    while index < len(lines):
+        line = lines[index]
+        if line.startswith(CRON_COMMENT_PREFIX):
+            match = re.match(rf"{re.escape(CRON_COMMENT_PREFIX)}\s+([^\s(]+)(?:\s+\(([0-9a-fA-F]+)\))?", line)
+            label_seed = None
+            fingerprint = None
+            if match:
+                label_seed = match.group(1)
+                fingerprint = match.group(2)
+            command_line = lines[index + 1] if index + 1 < len(lines) else ""
+            if target_label and label_seed != target_label:
+                index += 2
+                continue
+            cron_spec = ""
+            if command_line:
+                parts = command_line.split(maxsplit=5)
+                if len(parts) >= 5:
+                    cron_spec = " ".join(parts[:5])
+            state_path = extract_state_path_from_command_line(command_line)
+            next_due = read_schedule_state_next_due(state_path)
+            if next_due is None and cron_spec:
+                try:
+                    next_due = next_run_time(cron_spec, now - timedelta(minutes=1))
+                except Exception:
+                    next_due = None
+            jobs.append(
+                {
+                    "label": label_seed,
+                    "fingerprint": fingerprint,
+                    "schedule": cron_spec or None,
+                    "next_due": next_due.isoformat() if next_due else None,
+                    "command": command_line,
+                    "state_path": str(state_path) if state_path else None,
+                }
+            )
+            index += 2
+            continue
+        index += 1
+    return jobs
+
+
+def remove_launchd_jobs(label: str | None = None) -> int:
+    """Uninstall launchd jobs created by this tool, optionally filtered by label."""
+    target_label = sanitize_label_seed(label) if label else None
     require_backend_supported("launchd")
     launch_agents_dir = Path.home() / "Library" / "LaunchAgents"
     if not launch_agents_dir.exists():
@@ -1174,6 +1379,10 @@ def remove_launchd_jobs() -> int:
             label_seed = plist_path.stem[len(LAUNCHD_LABEL_PREFIX) :]
         else:
             label_seed = plist_path.stem
+
+        if target_label and label_seed != target_label:
+            continue
+
         try:
             with plist_path.open("rb") as handle:
                 payload = plistlib.load(handle)
@@ -1202,7 +1411,9 @@ def remove_launchd_jobs() -> int:
     return removed
 
 
-def remove_systemd_jobs() -> int:
+def remove_systemd_jobs(label: str | None = None) -> int:
+    """Disable and delete systemd timers/services created by mailmerge, optionally by label."""
+    target_label = sanitize_label_seed(label) if label else None
     require_backend_supported("systemd")
     systemd_dir = Path.home() / ".config" / "systemd" / "user"
     if not systemd_dir.exists():
@@ -1221,6 +1432,10 @@ def remove_systemd_jobs() -> int:
             label_seed = unit_name[len(SYSTEMD_UNIT_PREFIX) :]
         else:
             label_seed = unit_name
+
+        if target_label and label_seed != target_label:
+            continue
+
         if has_systemctl:
             subprocess.run(
                 ["systemctl", "--user", "disable", "--now", f"{unit_name}.timer"],
@@ -1266,7 +1481,109 @@ def remove_systemd_jobs() -> int:
     return removed
 
 
+def format_launchd_interval(interval: object) -> str:
+    """Return a compact representation of a launchd StartCalendarInterval."""
+    try:
+        return json.dumps(interval, sort_keys=True)
+    except Exception:
+        return str(interval)
+
+
+def list_launchd_jobs(label: str | None = None) -> List[dict]:
+    """List launchd mailmerge jobs, optionally filtered by label."""
+    target_label = sanitize_label_seed(label) if label else None
+    require_backend_supported("launchd")
+    launch_agents_dir = Path.home() / "Library" / "LaunchAgents"
+    if not launch_agents_dir.exists():
+        return []
+    jobs: List[dict] = []
+    for plist_path in launch_agents_dir.glob(f"{LAUNCHD_LABEL_PREFIX}*.plist"):
+        if not plist_path.is_file():
+            continue
+        if plist_path.stem.startswith(LAUNCHD_LABEL_PREFIX):
+            label_seed = plist_path.stem[len(LAUNCHD_LABEL_PREFIX) :]
+        else:
+            label_seed = plist_path.stem
+        if target_label and label_seed != target_label:
+            continue
+        try:
+            with plist_path.open("rb") as handle:
+                payload = plistlib.load(handle)
+        except Exception:
+            payload = {}
+        program_args = payload.get("ProgramArguments", []) or []
+        state_path = extract_state_path_from_arguments(program_args)
+        next_due = read_schedule_state_next_due(state_path)
+        jobs.append(
+            {
+                "label": label_seed,
+                "schedule": format_launchd_interval(payload.get("StartCalendarInterval")),
+                "next_due": next_due.isoformat() if next_due else None,
+                "plist": str(plist_path),
+                "state_path": str(state_path) if state_path else None,
+            }
+        )
+    return jobs
+
+
+def list_systemd_jobs(label: str | None = None) -> List[dict]:
+    """List systemd mailmerge jobs, optionally filtered by label."""
+    target_label = sanitize_label_seed(label) if label else None
+    require_backend_supported("systemd")
+    systemd_dir = Path.home() / ".config" / "systemd" / "user"
+    if not systemd_dir.exists():
+        return []
+    jobs: List[dict] = []
+    timers = list(systemd_dir.glob(f"{SYSTEMD_UNIT_PREFIX}*.timer"))
+    for timer_path in timers:
+        if not timer_path.is_file():
+            continue
+        unit_name = timer_path.stem
+        if unit_name.startswith(SYSTEMD_UNIT_PREFIX):
+            label_seed = unit_name[len(SYSTEMD_UNIT_PREFIX) :]
+        else:
+            label_seed = unit_name
+        if target_label and label_seed != target_label:
+            continue
+        service_path = systemd_dir / f"{unit_name}.service"
+        on_calendar = None
+        try:
+            content = timer_path.read_text(encoding="utf-8")
+            for line in content.splitlines():
+                if line.startswith("OnCalendar="):
+                    on_calendar = line.partition("=")[2].strip()
+                    break
+        except Exception:
+            on_calendar = None
+        state_path = None
+        if service_path.exists():
+            try:
+                service_content = service_path.read_text(encoding="utf-8")
+                for line in service_content.splitlines():
+                    if line.startswith("ExecStart="):
+                        command_line = line.partition("=")[2].strip()
+                        state_candidate = extract_state_path_from_command_line(command_line)
+                        if state_candidate is not None:
+                            state_path = state_candidate
+                        break
+            except Exception:
+                state_path = None
+        next_due = read_schedule_state_next_due(state_path)
+        jobs.append(
+            {
+                "label": label_seed,
+                "schedule": on_calendar,
+                "next_due": next_due.isoformat() if next_due else None,
+                "timer": str(timer_path),
+                "service": str(service_path) if service_path.exists() else None,
+                "state_path": str(state_path) if state_path else None,
+            }
+        )
+    return jobs
+
+
 def ensure_credentials(sender: str | None, password: str | None) -> Tuple[str, str]:
+    """Ensure sender and password are present, prompting interactively if needed."""
     if not sender:
         raise SystemExit(
             "Sender email address is required. Provide --sender or set GMAIL_ADDRESS."
@@ -1286,6 +1603,7 @@ def format_message(
     *,
     template_label: str,
 ) -> str:
+    """Render a template with the provided context, reporting missing keys."""
     try:
         return template.substitute(context)
     except KeyError as exc:
@@ -1319,6 +1637,7 @@ def send_messages(
     attachment_column: str | None,
     attachment_base: Path,
 ) -> None:
+    """Render and send personalized emails for each CSV row."""
     total = len(rows) if limit is None else min(limit, len(rows))
     if total == 0:
         logging.warning("No recipients found. Nothing to do.")
@@ -1375,6 +1694,8 @@ def send_messages(
                 context,
                 template_label="body",
             )
+            if subtype == "html":
+                body = normalize_html_body(body)
 
             logging.debug("Row %s context: %s", index, context)
 
@@ -1445,11 +1766,11 @@ def send_messages(
                     break
                 mime_type, _ = mimetypes.guess_type(str(attachment_path))
                 if mime_type:
-                    maintype, subtype = mime_type.split("/", 1)
+                    maintype, attachment_subtype = mime_type.split("/", 1)
                 else:
-                    maintype, subtype = "application", "octet-stream"
+                    maintype, attachment_subtype = "application", "octet-stream"
                 attachment_payloads.append(
-                    (attachment_path.name, data, maintype, subtype)
+                    (attachment_path.name, data, maintype, attachment_subtype)
                 )
 
             if not attachments_valid:
@@ -1521,6 +1842,7 @@ def send_messages(
                     message.as_string(),
                 )
                 continue
+            assert smtp is not None, "SMTP client unavailable; unexpected dry-run mismatch."
 
             try:
                 smtp.send_message(message)
@@ -1543,45 +1865,93 @@ def send_messages(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Entry point that orchestrates argument parsing, scheduling, and sending."""
     args = parse_args(argv or sys.argv[1:])
     logging.basicConfig(level=args.log_level, format="%(levelname)s: %(message)s")
 
-    remove_requested = bool(args.schedule_remove_all)
+    remove_label = args.schedule_remove
+    remove_all = bool(args.schedule_remove_all)
+    list_requested = bool(args.schedule_list)
+    if remove_label and remove_all:
+        logging.error("Cannot combine --schedule-remove with --schedule-remove-all.")
+        return 1
+    if list_requested and (remove_label or remove_all):
+        logging.error("Cannot combine --schedule-list with schedule removal flags.")
+        return 1
+
     backend = determine_backend(args.schedule_backend)
 
-    if remove_requested and args.schedule:
-        logging.error("Cannot combine --schedule with --schedule-remove-all.")
+    if (remove_label or remove_all or list_requested) and args.schedule:
+        logging.error("Cannot combine --schedule with removal/list flags.")
         return 1
 
-    if remove_requested and (args.schedule_label or args.schedule_overwrite):
+    if remove_all and (args.schedule_label or args.schedule_overwrite):
         logging.error("--schedule-remove-all cannot be combined with other scheduling flags.")
         return 1
+    if list_requested and args.schedule_overwrite:
+        logging.error("--schedule-list cannot be combined with --schedule-overwrite.")
+        return 1
 
-    if remove_requested:
+    if remove_label or remove_all:
+        target_label = sanitize_label_seed(remove_label) if remove_label else None
         try:
             if backend == "cron":
-                removed = remove_mailmerge_cron_jobs()
+                removed = remove_mailmerge_cron_jobs(target_label)
             elif backend == "launchd":
-                removed = remove_launchd_jobs()
+                removed = remove_launchd_jobs(target_label)
             else:
-                removed = remove_systemd_jobs()
+                removed = remove_systemd_jobs(target_label)
         except Exception as exc:
             logging.error("%s", exc)
             return 1
+        label_suffix = f" matching label '{target_label}'" if target_label else ""
         if removed:
             plural = "entry" if removed == 1 else "entries"
             logging.info(
-                "Removed %s scheduled mailmerge %s %s.",
+                "Removed %s scheduled mailmerge %s %s%s.",
                 removed,
                 backend,
                 plural,
+                label_suffix,
             )
         else:
-            logging.info("No mailmerge %s entries found to remove.", backend)
+            logging.info("No mailmerge %s entries found to remove%s.", backend, label_suffix)
+        return 0
+
+    if list_requested:
+        filter_label = args.schedule_label
+        try:
+            if backend == "cron":
+                jobs = list_cron_jobs(filter_label)
+            elif backend == "launchd":
+                jobs = list_launchd_jobs(filter_label)
+            else:
+                jobs = list_systemd_jobs(filter_label)
+        except Exception as exc:
+            logging.error("Failed to list scheduled jobs: %s", exc)
+            return 1
+        if not jobs:
+            extra = f" matching label '{sanitize_label_seed(filter_label)}'" if filter_label else ""
+            logging.info("No mailmerge %s jobs found%s.", backend, extra)
+        else:
+            logging.info("Scheduled mailmerge %s job(s):", backend)
+            for job in jobs:
+                label_display = job.get("label") or "(unknown)"
+                schedule_display = job.get("schedule") or "(unknown schedule)"
+                next_due_display = job.get("next_due") or "(next run unknown)"
+                location_parts = []
+                for key in ("command", "plist", "timer"):
+                    if job.get(key):
+                        location_parts.append(job[key])
+                location_display = " | ".join(location_parts) if location_parts else ""
+                state_path = job.get("state_path")
+                if state_path:
+                    location_display = f"{location_display} | state={state_path}" if location_display else f"state={state_path}"
+                logging.info("  Label: %s | Next run: %s | Schedule: %s%s", label_display, next_due_display, schedule_display, f" | {location_display}" if location_display else "")
         return 0
 
     if args.csv is None:
-        logging.error("CSV file is required unless --schedule-remove-all is provided.")
+        logging.error("CSV file is required unless schedule management flags are used.")
         return 1
     if args.subject is None:
         logging.error("Subject template is required.")
@@ -1599,6 +1969,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.body.is_file():
         logging.error("Body template file not found: %s", args.body)
         return 1
+
+    resolved_body_type = resolve_body_subtype(args.body_type, args.body)
+    if resolved_body_type != args.body_type:
+        logging.debug(
+            "Detected '%s' body type for %s.",
+            resolved_body_type,
+            args.body,
+        )
+    args.body_type = resolved_body_type
 
     if args.schedule:
         try:
