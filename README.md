@@ -33,6 +33,8 @@ After installation, invoke the CLI with `mailmerge --help` or `python3 -m mailme
    bob@example.com,Bob,Zephyr
    ```
 
+   Sample CSV and template files are provided under `examples/` (e.g. `examples/example_contacts.csv`, `examples/example_email.txt`).
+
 2. Create a message body template (plain text or HTML) using `$variable` placeholders. Example `body.txt`:
 
    ```text
