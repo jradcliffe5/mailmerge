@@ -82,6 +82,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Path to a text or HTML template file used as the message body.",
     )
     parser.add_argument(
+        "--signature",
+        type=Path,
+        help="Path to a text or HTML template appended after the body for each message.",
+    )
+    parser.add_argument(
         "-t",
         "--body-type",
         choices=("auto", "plain", "html"),
@@ -372,6 +377,27 @@ def normalize_html_body(body: str) -> str:
     )
 
 
+def append_signature(body: str, signature: str, *, subtype: str) -> str:
+    """Append a rendered signature to the message body with sensible spacing."""
+    if not signature:
+        return body
+    if subtype == "html":
+        if body:
+            if not body.endswith("\n"):
+                body += "\n"
+            return body + signature.lstrip("\n")
+        return signature
+
+    if not body:
+        return signature
+    combined = body
+    if not combined.endswith("\n"):
+        combined += "\n"
+    if not combined.endswith("\n\n"):
+        combined += "\n"
+    return combined + signature.lstrip("\n")
+
+
 def parse_addresses(raw: str) -> List[str]:
     """Split comma/semicolon delimited recipient strings into discrete addresses."""
     return [addr.strip() for addr in raw.replace(";", ",").split(",") if addr.strip()]
@@ -444,6 +470,9 @@ def build_program_arguments(args: argparse.Namespace, *, schedule_spec: str | No
         "--body",
         str(args.body),
     ]
+
+    if args.signature:
+        command.extend(["--signature", str(args.signature)])
 
     if args.body_type != "plain":
         command.extend(["--body-type", args.body_type])
@@ -1621,6 +1650,7 @@ def send_messages(
     password: str,
     subject_template: Template,
     body_template: Template,
+    signature_template: Template | None,
     recipient_column: str,
     smtp_server: str,
     smtp_port: int,
@@ -1694,6 +1724,17 @@ def send_messages(
                 context,
                 template_label="body",
             )
+            if signature_template is not None:
+                try:
+                    signature = format_message(
+                        signature_template,
+                        context,
+                        template_label="signature",
+                    )
+                except ValueError as exc:
+                    logging.error("Skipping row %s: %s", index, exc)
+                    continue
+                body = append_signature(body, signature, subtype=subtype)
             if subtype == "html":
                 body = normalize_html_body(body)
 
@@ -1969,6 +2010,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.body.is_file():
         logging.error("Body template file not found: %s", args.body)
         return 1
+    if args.signature:
+        args.signature = args.signature.expanduser().resolve()
+        if not args.signature.is_file():
+            logging.error("Signature template file not found: %s", args.signature)
+            return 1
 
     resolved_body_type = resolve_body_subtype(args.body_type, args.body)
     if resolved_body_type != args.body_type:
@@ -2007,6 +2053,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         rows = load_recipients(args.csv)
         subject_template = Template(args.subject)
         body_template = read_template(args.body)
+        signature_template = read_template(args.signature) if args.signature else None
         cc_templates = [Template(value) for value in args.cc]
         bcc_templates = [Template(value) for value in args.bcc]
         attachment_templates = [Template(value) for value in args.attachments]
@@ -2031,6 +2078,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         password=password,
         subject_template=subject_template,
         body_template=body_template,
+        signature_template=signature_template,
         recipient_column=args.recipient_column,
         smtp_server=args.smtp_server,
         smtp_port=args.smtp_port,

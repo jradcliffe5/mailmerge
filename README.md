@@ -22,7 +22,7 @@ python3 -m pip install .
 ### Build and install a wheel (optional)
 ```shell
 python3 -m build
-python3 -m pip install dist/gmail_mailmerge-0.9.0-py3-none-any.whl
+python3 -m pip install dist/gmail_mailmerge-1.0.0-py3-none-any.whl
 ```
 
 ### Run without installing
@@ -55,6 +55,7 @@ You can also run the installed console script via `mailmerge --help` or `python3
   Cheers,
   Jack
   ```
+- Keep a shared closing in a separate template (e.g. `signature.txt`) and include it with `--signature signature.txt`.
 - Files ending in `.html` (or detected as HTML) automatically send as HTML. Plain-text HTML templates are wrapped in a minimal HTML document for consistent rendering. Use `--body-type plain` to force plain text.
 
 ### 3. Provide credentials
@@ -90,6 +91,7 @@ Run `python3 mailmerge.py --help` or `mailmerge --help` for the complete usage t
 | --- | --- | --- | --- |
 | `-s` | `--subject` | Subject template | Uses `$placeholders` from the CSV. |
 | `-b` | `--body` | Body template path | Supports plain text and HTML. |
+|  | `--signature` | Optional signature template | Appends a shared closing after the body; supports `$placeholders`. |
 | `-t` | `--body-type` | Body format | Auto-detected; override with `plain` or `html`. |
 | `-n` | `--dry-run` | Preview emails without sending | Prints rendered messages to stdout. |
 
